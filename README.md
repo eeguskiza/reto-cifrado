@@ -3,9 +3,11 @@
 Brute-force CUDA contra **AES-CBC + PKCS7** con MD5 + estructura de password
 conocida.
 
-> Estado: **Fase 2 completada** (KDFs, descifrado de referencia CPU, plan de
-> 27 configs, persistencia atómica, CLI ampliada). Sin CUDA aún —
-> requerido a partir de Fase 3.
+> Estado: **Fase 3 + Fase 3.5 completadas**. Kernels CUDA con paridad
+> CPU↔GPU validada, MD5 RFC 1321, AES-128/192/256 FIPS-197, 14 KDFs,
+> plan de 42 configs CBC. Throughput sostenido medido: ~1.2 GH/s en
+> RTX 5070 Ti (target spec preliminar 3 GH/s; Fase 6 optimiza —
+> ver `DECISIONS.md` D-012).
 
 ## Estructura del password objetivo
 
@@ -32,24 +34,37 @@ Cardinalidad del espacio:
 de clave). Confirmado por el autor del reto. El proyecto **solo soporta
 CBC**, no es deuda técnica (ver `DECISIONS.md` D-006).
 
-## KDFs soportadas (9)
+## KDFs soportadas (14)
 
-| ID            | Definición                                  | klen |
-|---------------|---------------------------------------------|------|
-| `md5_utf8`    | `MD5(pw_utf8)`                              | 16 B |
-| `md5_utf16le` | `MD5(pw_utf16le)`                           | 16 B |
-| `md5_utf16be` | `MD5(pw_utf16be)`                           | 16 B |
-| `md5x2_utf8`  | `MD5(MD5(pw_utf8))`                         | 16 B |
-| `md5_dup`     | `MD5(pw_utf8) ‖ MD5(pw_utf8)`               | 32 B |
-| `md5_md5rev`  | `MD5(pw_utf8) ‖ MD5(pw_utf8)[::-1]`         | 32 B |
-| `md5hex_full` | hexdigest ASCII completo                    | 32 B |
-| `md5hex_lo16` | primeros 16 chars del hexdigest             | 16 B |
-| `pw_padded`   | `(pw_utf8 + b"\0"*16)[:16]`                 | 16 B |
+**Originales (Fase 2/3) — IDs 0..8**:
+
+| ID  | Nombre        | Definición                                  | klen | AES  |
+|-----|---------------|---------------------------------------------|------|------|
+| 0   | `md5_utf8`    | `MD5(pw_utf8)`                              | 16 B | 128  |
+| 1   | `md5_utf16le` | `MD5(pw_utf16le)`                           | 16 B | 128  |
+| 2   | `md5_utf16be` | `MD5(pw_utf16be)`                           | 16 B | 128  |
+| 3   | `md5x2_utf8`  | `MD5(MD5(pw_utf8))`                         | 16 B | 128  |
+| 4   | `md5_dup`     | `MD5(pw_utf8) ‖ MD5(pw_utf8)`               | 32 B | 256  |
+| 5   | `md5_md5rev`  | `MD5(pw_utf8) ‖ MD5(pw_utf8)[::-1]`         | 32 B | 256  |
+| 6   | `md5hex_full` | hexdigest ASCII completo                    | 32 B | 256  |
+| 7   | `md5hex_lo16` | primeros 16 chars del hexdigest             | 16 B | 128  |
+| 8   | `pw_padded`   | `(pw_utf8 + b"\0"*16)[:16]`                 | 16 B | 128  |
+
+**Ampliación académica (Fase 3.5) — IDs 9..13**:
+
+| ID  | Nombre                    | Definición                                                  | klen | AES  |
+|-----|---------------------------|-------------------------------------------------------------|------|------|
+| 9   | `evp_md5_aes256_nosalt`   | `EVP_BytesToKey(MD5, pw, salt=None, iter=1)[..32]`          | 32 B | 256  |
+| 10  | `evp_md5_aes192_nosalt`   | mismo, truncado a 24 B                                       | 24 B | 192  |
+| 11  | `md5_trunc24`             | `MD5(pw) ‖ MD5(pw)[..8]`                                     | 24 B | 192  |
+| 12  | `md5_md5x2_24`            | `MD5(pw) ‖ MD5(MD5(pw))[..8]`                                | 24 B | 192  |
+| 13  | `md5hex_lo24`             | primeros 24 chars ASCII de `hexdigest`                       | 24 B | 192  |
 
 IVs: `first16` (los 16 primeros B del fichero), `zeros`, `md5pw`.
 
-Plan total: 9 KDFs × 1 modo × 3 IVs = **27 configuraciones** ordenadas por
-probabilidad descendente. Ver `DECISIONS.md` D-008.
+Plan total: 14 KDFs × 1 modo × 3 IVs = **42 configuraciones** ordenadas
+por probabilidad descendente. Las 27 originales forman prefijo estricto
+del plan extendido (D-014). Ver `DECISIONS.md` D-008 y D-014.
 
 ## Validación de hit (3 pasos)
 
@@ -108,10 +123,34 @@ quattro-crack run --input ./data/cifrado.txt --preset exhaustive
 - [x] Fase 0 — esqueleto + loader + `inspect`
 - [x] Fase 1 — generador combinatorio CPU (crítico)
 - [x] Fase 2 — KDFs + descifrado CPU + plan + estado atómico + CLI ampliada
-- [ ] Fase 3 — kernel CUDA básico (`md5_utf8/cbc/first16` AES-128)
-- [ ] Fase 4 — multi-config + persistencia + reanudación + tests de pausa
+- [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/256, brute para 9 KDFs)
+- [ ] Fase 4 — multi-config runner + persistencia + reanudación + tests de pausa
 - [ ] Fase 5 — TUI en vivo
-- [ ] Fase 6 — optimización (opt-in)
+- [ ] Fase 6 — optimización (warp-cooperative AES, MD5 vectorizado)
+
+## Build CUDA
+
+Prerequisitos:
+- CUDA Toolkit ≥ 12.8 (recomendado 13.0). Detectado: `nvcc --version`.
+- GPU NVIDIA con compute capability ≥ 8.9 (Ada) — nativo a 12.0 (Blackwell).
+- Driver compatible (en WSL2: el driver Windows expone CUDA al guest).
+
+`build.rs` automáticamente:
+- Detecta `nvcc` (PATH, `NVCC`, `CUDA_HOME`, rutas estándar).
+- Comprueba si `nvcc` soporta `-arch=sm_120` (Blackwell). Si no, cae a
+  `sm_89` (Ada) y emite warning `cargo:warning=Compilando para sm_89...`.
+- Compila `kernels/brute.cu` **9 veces** (una por KDF) a PTX en `OUT_DIR`.
+- Compila los kernels auxiliares para tests (`dump_passwords`, `md5_test`,
+  `aes_test`, `force_emit_hits`).
+
+Verificación rápida:
+
+```bash
+cargo test --release --test cpu_gpu_parity        # paridad CPU↔GPU 1M
+cargo test --release --test md5_rfc1321           # MD5 RFC 1321
+cargo test --release --test aes_fips197           # AES NIST FIPS-197
+cargo test --release --test e2e_synthetic         # E2E + buffer hits
+```
 
 ## Troubleshooting WSL2
 

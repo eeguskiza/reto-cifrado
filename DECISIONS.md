@@ -167,3 +167,193 @@ afirma el orden literal byte-a-byte. Si el orden cambia, falla.
 Los presets son contratos: el usuario que arranca con `--preset likely`
 debe poder reanudar con `--preset exhaustive` y que las 12 ya barridas
 queden marcadas como completadas. Esa proyección la implementa Fase 4.
+
+---
+
+## D-009 — T-tables AES en `__shared__`, gmul en registros
+
+**Contexto**: la versión inicial mantenía Td0..Td3 + INV_SBOX en
+`__device__ __constant__`. El throughput inicial fue 0.27 GH/s.
+
+**Diagnóstico**: la memoria `__constant__` de CUDA tiene un puerto único
+de broadcast: cuando todos los threads de un warp leen la misma
+dirección, se sirve en 1 ciclo; cuando leen direcciones distintas
+(caso típico de un T-table lookup driven-by-data), las lecturas se
+**serializan**. En decrypt, cada thread accede a 16 direcciones
+distintas por ronda intermedia × 9 rondas + 16 finales = 160 lookups.
+El factor de serialización contra constant cache mide ~6× peor que
+contra shared.
+
+**Decisión**:
+
+- `Td0..Td3` (4 × 1 KB), `INV_SBOX` (256 B) y `SBOX` (256 B, para
+  `aes_inv_mix_column_via_td0` durante key schedule) **se cargan a
+  `__shared__` cooperativamente al arrancar cada block** en
+  `brute_kernel`. Total ≈ 4640 B/block, < 5 % de los 96 KB shared del
+  SM en sm_120.
+- Las wrappers públicas `aes128_decrypt_block` / `aes256_decrypt_block`
+  siguen leyendo de `__constant__` para que `aes_test.cu` (los tests
+  FIPS-197) no necesiten setup de shared.
+
+**Medido**: 0.27 → 1.57 GH/s al pasar T-tables a shared (5.8× speedup).
+Una ruta alternativa probada (`aes_inv_mix_column_via_td0`, reutilizar
+Td0 + SBOX en lugar de gmul-loop) **empeoró** a 1.25 GH/s; el gmul-loop
+de 8 iteraciones bajo `#pragma unroll` colapsa a ~8 instrucciones
+bit-a-bit en registros y vence al doble lookup. Documentado en código
+con `// PERF:`.
+
+**Estado**: 1.2 GH/s sostenido (best of 5 sobre 128 Mi idx) — por
+debajo del target spec preliminar de 3 GH/s. Fase 6 atacará: warp-
+cooperative AES decrypt, MD5 vectorizado, Td-tables packed para que
+quepan menos por warp.
+
+---
+
+## D-010 — Target `sm_120` (Blackwell) con fallback `sm_89` (Ada)
+
+**Contexto**: la GPU del usuario es RTX 5070 Ti con compute capability
+12.0 (Blackwell). CUDA Toolkit < 12.8 no soporta `sm_120`.
+
+**Decisión**: `build.rs` intenta compilar un kernel-probe a `-arch=sm_120`;
+si falla cae a `sm_89` y emite `cargo:warning=Compilando para sm_89 (Ada).
+Para sm_120 nativo (Blackwell) actualiza CUDA Toolkit a ≥ 12.8`.
+
+**Estado actual**: detectado nvcc 13.0.88 ⇒ `sm_120` activo. Variable
+`QC_CUDA_ARCH` exportada al build de Rust para diagnóstico.
+
+---
+
+## D-011 — Único `kernels/brute.cu` parametrizado por `#define KDF_ID`
+
+**Contexto**: 9 KDFs implementadas. Opciones consideradas:
+
+(A) 9 ficheros `kernels/brute_<kdf>.cu`, cada uno con su KDF inline.
+(B) **Un fichero `brute.cu` parametrizado**, compilado 9 veces con
+    `nvcc -DKDF_ID=<0..8> -DKEY_LEN=<16|32>`.
+(C) Un único PTX con dispatch dinámico runtime sobre `kdf_id`.
+
+**Decisión**: opción **B**.
+
+- Ventajas vs (A): un único cuerpo de kernel, una única matriz de
+  optimizaciones, cero divergencia entre variantes salvo el bloque
+  `derive_key`.
+- Ventajas vs (C): cero coste runtime de switch, cada PTX queda
+  especializado y nvcc optimiza KDF-específicamente (e.g., `pw_padded`
+  no incluye código MD5 en el PTX final).
+
+**Resultado**: `target/.../brute_<id>.ptx` para id ∈ 0..8, embebido en
+el binario con `include_str!()` y cargado on-demand por
+`KernelBundle::load(kdf)`.
+
+**Tests**: `tests/aes_fips197.rs` valida AES per se; `tests/e2e_synthetic.rs`
+valida el dispatch correcto del KDF para `md5_utf8` (id=0, AES-128) y
+`md5_dup` (id=4, AES-256), incluido el modo `md5pw` que computa el IV
+in-device.
+
+---
+
+## D-012 — Throughput Fase 3: 1.2 GH/s sostenidos vs target 3 GH/s
+
+**Estado medido** (RTX 5070 Ti, sm_120, `md5_utf8/cbc/zeros` AES-128,
+batch 128 Mi, best-of-5):
+
+```
+≈ 1.2 GH/s sostenidos
+```
+
+El target preliminar de la spec era **≥ 3 GH/s**. Quedamos por debajo
+por un factor 2.5×.
+
+**Anatomía del kernel** por candidata (KDF md5_utf8 + AES-128, ruta
+más simple):
+
+| Etapa                     | Coste relativo | Notas |
+|---------------------------|----------------|-------|
+| `index_to_password`       | bajo           | divisiones u64, accesos a `DISPOSITIONS` en `__constant__` |
+| `md5_compute(pw, 14, …)`  | medio          | 1 bloque MD5 (64 rondas) sobre 14 B con padding |
+| `aes128_set_key`          | **alto**       | forward expansion + reverse + 36 InvMixColumns (con `aes_gmul` 8-iter unrolled) |
+| `aes128_decrypt_block`    | medio          | 9 rondas T-tables en `__shared__` + final round |
+| XOR-IV + comparación      | trivial        | 4 × `uint32_t` |
+
+`ptxas`: 120 registros/thread, 16 B stack frame (sin spills), 4640 B
+shared/block. Con 128 threads/block ⇒ ≈ 4 blocks/SM ⇒ 512 threads/SM
+⇒ ≈ 25 % occupancy en sm_120 (target 50–75 %).
+
+**Causa principal**: register pressure por `rk[44|52|60]` mantenido
+en registros tras unroll completo (necesario para evitar local memory
+en accesos con índice runtime). Esto cierra la occupancy a la mitad
+de lo deseable.
+
+**Decisión**: aceptar 1.2 GH/s como "preliminar funcional" para Fase 3.
+**Fase 6** atacará explícitamente, en orden de coste/beneficio:
+
+1. **Warp-cooperative AES**: 4 threads cooperan en 1 decrypt (cada uno
+   procesa 1 columna), `rk` compartido en `__shared__` por warp.
+   Trade: -28 % registers/thread, -75 % redundant work, +sync.
+2. **MD5 K/S tables a `__shared__`**: hoy en `__constant__`, mismo
+   problema que tenían las T-tables.
+3. **`__launch_bounds__`** explícito tras medir el equilibrio óptimo
+   regs/occupancy.
+4. **PTX inline asm** para `lop3.b32` (XOR de 3 entradas en una
+   instrucción) en el round body de AES.
+
+A 1.2 GH/s, el preset `canonical` (4 configs × 5.96e13 idx) tarda
+≈ 11 h en lugar de las 1.5 h estimadas. Se documenta en README; el
+usuario decide si arrancar el barrido nocturno con esto o esperar a
+Fase 6.
+
+---
+
+## D-013 — `KeyMaterial` como `struct(Vec<u8>)` desde Fase 3.5
+
+**Contexto**: en Fase 2 `KeyMaterial` era un enum con dos variantes:
+
+```rust
+pub enum KeyMaterial { K16([u8; 16]), K32([u8; 32]) }
+```
+
+Ergonómico para 16/32 bytes pero rígido al añadir AES-192 (24 B).
+
+**Decisión**: refactorizar a `struct KeyMaterial(Vec<u8>)` con la misma
+API pública (`as_slice`, `len`, `is_empty`).
+
+**Justificación**:
+
+- Soporta cualquier tamaño 16/24/32 sin proliferación de variantes.
+- Cero call sites afectados: nadie hacía `match` sobre `K16`/`K32`,
+  todos consumían vía `as_slice()` o `len()`.
+- Una asignación heap por `derive()` — coste despreciable, las KDFs
+  CPU se invocan solo en validación de hits, no en hot loop GPU.
+
+**Validado**: build + 78 tests verdes tras el refactor.
+
+---
+
+## D-014 — IDs estables 0..8, ampliación 9..13 para Fase 3.5
+
+**Contexto**: la spec original (Fase 3) catalogó 9 KDFs con IDs 0..8.
+Esos IDs forman parte del contrato del kernel CUDA (cada PTX se compila
+con `-DKDF_ID=N` y se carga indexando `PTX_BRUTE[id]`) y aparecen en los
+hits emitidos (`DeviceHit::kdf_id`).
+
+**Decisión**: al añadir las 5 KDFs nuevas en Fase 3.5, los IDs 0..8
+**no se renumeran**. Las nuevas reciben IDs 9..13 en el orden:
+
+| ID | Variante                  | klen | AES   |
+|----|---------------------------|------|-------|
+| 9  | `EvpMd5Aes256Nosalt`      | 32 B | 256   |
+| 10 | `EvpMd5Aes192Nosalt`      | 24 B | 192   |
+| 11 | `Md5Trunc24`              | 24 B | 192   |
+| 12 | `Md5Md5x2_24`             | 24 B | 192   |
+| 13 | `Md5HexLo24`              | 24 B | 192   |
+
+**Tests bloqueantes**:
+
+- `config::tests::original_nine_keep_their_ids`: IDs 0..8 literales.
+- `config::tests::kdf_ids_match_array_order`: orden y declaración alineados.
+- `tests/plan_order.rs::test_first_27_are_strict_prefix_of_42`:
+  el plan extendido tiene las 27 entries originales como prefijo
+  byte-a-byte.
+
+Esto garantiza que sesiones interrumpidas en Fase 3 puedan reanudarse
+con el binario de Fase 3.5 sin reordenar progreso ya guardado.
