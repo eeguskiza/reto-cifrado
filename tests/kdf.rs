@@ -45,6 +45,28 @@ const VECTORS: &[(&str, Kdf, &str)] = &[
     (".bAioembl1452.", Kdf::Md5HexFull,  "3132383966386437303732636465646534663735386366373734363163383061"),
     (".bAioembl1452.", Kdf::Md5HexLo16,  "31323839663864373037326364656465"),
     (".bAioembl1452.", Kdf::PwPadded,    "2e6241696f656d626c313435322e0000"),
+
+    // ---------- Fase 3.5: 5 KDFs nuevas × 3 passwords ----------
+    // pw = ".aAaabbbb1000."
+    (".aAaabbbb1000.", Kdf::EvpMd5Aes256Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cbd9b4ed34eb9eaff1"),
+    (".aAaabbbb1000.", Kdf::EvpMd5Aes192Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cb"),
+    (".aAaabbbb1000.", Kdf::Md5Trunc24,         "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc"),
+    (".aAaabbbb1000.", Kdf::Md5Md5x2_24,        "9ac15f8d5a92b3bc03a949212e6a6aedfcffd97b40ba100b"),
+    (".aAaabbbb1000.", Kdf::Md5HexLo24,         "396163313566386435613932623362633033613934393231"),
+
+    // pw = ".zzzzuuuU1999."
+    (".zzzzuuuU1999.", Kdf::EvpMd5Aes256Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0682f1d54bba649b0"),
+    (".zzzzuuuU1999.", Kdf::EvpMd5Aes192Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0"),
+    (".zzzzuuuU1999.", Kdf::Md5Trunc24,         "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac"),
+    (".zzzzuuuU1999.", Kdf::Md5Md5x2_24,        "9a3fbdba108501ac3f19bb7bee9829745ff6d2280f90df47"),
+    (".zzzzuuuU1999.", Kdf::Md5HexLo24,         "396133666264626131303835303161633366313962623762"),
+
+    // pw = ".bAioembl1452."
+    (".bAioembl1452.", Kdf::EvpMd5Aes256Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2ee916658be60ddcfa"),
+    (".bAioembl1452.", Kdf::EvpMd5Aes192Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2e"),
+    (".bAioembl1452.", Kdf::Md5Trunc24,         "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede"),
+    (".bAioembl1452.", Kdf::Md5Md5x2_24,        "1289f8d7072cdede4f758cf77461c80a6153594fc9a49706"),
+    (".bAioembl1452.", Kdf::Md5HexLo24,         "313238396638643730373263646564653466373538636637"),
 ];
 
 #[test]

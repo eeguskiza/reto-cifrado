@@ -33,7 +33,8 @@ impl Preset {
         match self {
             Self::Canonical => 4,
             Self::Likely => 12,
-            Self::Exhaustive => 27,
+            // Fase 3.5: 27 originales + 15 nuevas (5 KDFs × 3 IVs).
+            Self::Exhaustive => 42,
         }
     }
 
@@ -44,17 +45,28 @@ impl Preset {
     }
 }
 
-/// Plan ordenado de 27 configuraciones, listadas por probabilidad
-/// descendente conforme al prompt v3.
+/// Plan ordenado de 42 configuraciones, listadas por probabilidad
+/// descendente.
+///
+/// **Estructura del orden**:
+///
+/// 1. **27 entries originales (Fase 3)**: producto de las 9 KDFs MD5
+///    primarias × 3 IVs en el orden documentado en el prompt v3.
+///    `tests/plan_order.rs::test_default_plan_order_is_42_cbc_configs`
+///    verifica que estas 27 son **prefijo estricto** del plan completo.
+/// 2. **15 entries Fase 3.5**: 5 KDFs nuevas × 3 IVs, ordenadas:
+///    primero las EVP_BytesToKey (más probables académicamente),
+///    después las KDFs de 24 B truncadas; cada KDF con sus tres IVs
+///    (`first16`, `zeros`, `md5pw`) consecutivos.
 ///
 /// **Importante**: este orden es contrato. Si lo cambias, actualiza
-/// también `tests/plan.rs::test_default_plan_order_is_27_cbc_configs`
-/// y la documentación.
+/// también `tests/plan_order.rs` y la documentación.
 pub fn default_plan_order() -> Vec<ConfigEntry> {
     use IvSource::*;
     use Kdf::*;
 
     [
+        // ==================== 27 ORIGINALES (FASE 3) ====================
         // 1–4: canonical
         (Md5Utf8, First16),
         (Md5Utf16Le, First16),
@@ -69,7 +81,7 @@ pub fn default_plan_order() -> Vec<ConfigEntry> {
         (Md5x2Utf8, Md5Pw),
         (PwPadded, Zeros),
         (PwPadded, Md5Pw),
-        // 13–27: tail (UTF-16-BE y los KDFs de 32 B)
+        // 13–27: tail (UTF-16-BE y los KDFs originales de 32 B)
         (Md5Utf16Be, First16),
         (Md5Utf16Be, Zeros),
         (Md5Utf16Be, Md5Pw),
@@ -85,6 +97,24 @@ pub fn default_plan_order() -> Vec<ConfigEntry> {
         (Md5Md5Rev, Md5Pw),
         (Md5HexFull, Md5Pw),
         (Md5HexLo16, Md5Pw),
+        // ==================== 15 NUEVAS (FASE 3.5) ====================
+        // 28–33: EVP_BytesToKey (más probables académicamente)
+        (EvpMd5Aes256Nosalt, First16),
+        (EvpMd5Aes256Nosalt, Zeros),
+        (EvpMd5Aes256Nosalt, Md5Pw),
+        (EvpMd5Aes192Nosalt, First16),
+        (EvpMd5Aes192Nosalt, Zeros),
+        (EvpMd5Aes192Nosalt, Md5Pw),
+        // 34–42: KDFs truncadas a 24 B (AES-192 sin EVP)
+        (Md5Trunc24, First16),
+        (Md5Trunc24, Zeros),
+        (Md5Trunc24, Md5Pw),
+        (Md5Md5x2_24, First16),
+        (Md5Md5x2_24, Zeros),
+        (Md5Md5x2_24, Md5Pw),
+        (Md5HexLo24, First16),
+        (Md5HexLo24, Zeros),
+        (Md5HexLo24, Md5Pw),
     ]
     .into_iter()
     .map(|(kdf, iv)| ConfigEntry::new(kdf, iv))
@@ -152,9 +182,9 @@ mod tests {
     use crate::config::Mode;
 
     #[test]
-    fn default_order_has_27_entries_all_cbc() {
+    fn default_order_has_42_entries_all_cbc() {
         let p = default_plan_order();
-        assert_eq!(p.len(), 27);
+        assert_eq!(p.len(), 42);
         for (i, c) in p.iter().enumerate() {
             assert_eq!(c.mode, Mode::Cbc, "entrada {i} debe ser CBC");
         }
@@ -164,10 +194,10 @@ mod tests {
     fn presets_have_documented_lengths() {
         assert_eq!(Preset::Canonical.config_count(), 4);
         assert_eq!(Preset::Likely.config_count(), 12);
-        assert_eq!(Preset::Exhaustive.config_count(), 27);
+        assert_eq!(Preset::Exhaustive.config_count(), 42);
         assert_eq!(Preset::Canonical.configs().len(), 4);
         assert_eq!(Preset::Likely.configs().len(), 12);
-        assert_eq!(Preset::Exhaustive.configs().len(), 27);
+        assert_eq!(Preset::Exhaustive.configs().len(), 42);
     }
 
     #[test]
@@ -188,11 +218,11 @@ mod tests {
         for c in &p {
             assert!(seen.insert((c.kdf, c.iv)), "duplicado: {}", c.display_id());
         }
-        assert_eq!(seen.len(), 27);
+        assert_eq!(seen.len(), 42);
     }
 
     #[test]
-    fn covers_all_9_kdfs_with_3_ivs_each() {
+    fn covers_all_14_kdfs_with_3_ivs_each() {
         let p = default_plan_order();
         for &kdf in Kdf::all() {
             let count = p.iter().filter(|c| c.kdf == kdf).count();
@@ -200,7 +230,7 @@ mod tests {
         }
         for &iv in &[IvSource::First16, IvSource::Zeros, IvSource::Md5Pw] {
             let count = p.iter().filter(|c| c.iv == iv).count();
-            assert_eq!(count, 9, "iv={} debe tener 9 KDFs en el plan", iv.as_str());
+            assert_eq!(count, 14, "iv={} debe tener 14 KDFs en el plan", iv.as_str());
         }
     }
 }

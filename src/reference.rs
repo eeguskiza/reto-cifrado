@@ -14,7 +14,7 @@
 //!
 //! Ver `DECISIONS.md` D-007.
 
-use aes::{Aes128, Aes256};
+use aes::{Aes128, Aes192, Aes256};
 use cbc::Decryptor;
 use cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use thiserror::Error;
@@ -40,7 +40,7 @@ pub enum HitVerdict {
 
 #[derive(Debug, Error)]
 pub enum DecryptError {
-    #[error("longitud de clave no soportada: {0} (esperado 16 o 32)")]
+    #[error("longitud de clave no soportada: {0} (esperado 16, 24 o 32)")]
     BadKeyLen(usize),
     #[error("ciphertext no alineado a 16 B: {0}")]
     Unaligned(usize),
@@ -63,7 +63,12 @@ pub fn decrypt_cbc_raw(
         16 => {
             type Dec = Decryptor<Aes128>;
             let dec = Dec::new(key.into(), iv.into());
-            // NoPadding: no quita bytes del final; valida solo alineación.
+            dec.decrypt_padded_mut::<NoPadding>(&mut buf)
+                .expect("longitud múltiplo de 16, NoPadding nunca falla");
+        }
+        24 => {
+            type Dec = Decryptor<Aes192>;
+            let dec = Dec::new(key.into(), iv.into());
             dec.decrypt_padded_mut::<NoPadding>(&mut buf)
                 .expect("longitud múltiplo de 16, NoPadding nunca falla");
         }
@@ -125,6 +130,13 @@ pub fn encrypt_cbc_pkcs7(key: &[u8], iv: &[u8; 16], pt: &[u8]) -> Result<Vec<u8>
     match key.len() {
         16 => {
             type Enc = Encryptor<Aes128>;
+            let enc = Enc::new(key.into(), iv.into());
+            let n = pt.len();
+            enc.encrypt_padded_mut::<Pkcs7>(&mut buf, n)
+                .expect("buffer suficiente");
+        }
+        24 => {
+            type Enc = Encryptor<Aes192>;
             let enc = Enc::new(key.into(), iv.into());
             let n = pt.len();
             enc.encrypt_padded_mut::<Pkcs7>(&mut buf, n)
