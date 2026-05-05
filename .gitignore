@@ -1,0 +1,29 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Persisted runtime state — never commit
+/state/*.toml
+/state/*.toml.new
+/state/*.toml.bak
+
+# Logs
+/logs/*.log
+
+# OS / IDE
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# WSL artefacts copiados desde Windows
+*:Zone.Identifier
+
+# Datos del reto: el binario, no el original
+# (mantenemos un placeholder en data/.gitkeep)
+/data/*
+!/data/.gitkeep
+
+# Original que el usuario dejó en la raíz al iniciar el proyecto
+/reto_cifrado.txt
