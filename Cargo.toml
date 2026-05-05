@@ -16,15 +16,22 @@ name = "quattro-crack"
 path = "src/main.rs"
 
 [dependencies]
+aes = "0.8"
 anyhow = "1"
 base64 = "0.22"
+cbc = "0.1"
+cipher = "0.4"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "1"
+toml = "0.8"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
