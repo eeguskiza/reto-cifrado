@@ -4,3 +4,4 @@
 //! vive en `src/main.rs`.
 
 pub mod ciphertext;
+pub mod combinatorics;
