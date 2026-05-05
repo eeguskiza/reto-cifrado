@@ -236,7 +236,8 @@ fn test_resume_rejects_modified_input() {
         only_configs: vec![],
     };
     let stop = Arc::new(AtomicBool::new(false));
-    let result = runner::run(opts, stop);
+    let sink = quattro_crack::runner::StderrSink::new();
+    let result = runner::run(opts, &sink, stop);
     let err = result.expect_err("resume con SHA distinto debe fallar");
 
     let msg = format!("{err:?}");
@@ -272,7 +273,8 @@ fn test_resume_without_plan_fails_with_clear_message() {
         only_configs: vec![],
     };
     let stop = Arc::new(AtomicBool::new(false));
-    let err = runner::run(opts, stop).expect_err("resume sin plan.toml debe fallar");
+    let sink = quattro_crack::runner::StderrSink::new();
+    let err = runner::run(opts, &sink, stop).expect_err("resume sin plan.toml debe fallar");
     let msg = format!("{err:?}");
     assert!(
         msg.to_lowercase().contains("plan.toml")

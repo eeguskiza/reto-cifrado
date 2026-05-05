@@ -1,15 +1,19 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use tracing_appender::non_blocking::WorkerGuard;
 
 use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, CT_LEN, IV_LEN, TOTAL_BIN_LEN};
+use quattro_crack::combinatorics::N as N_TOTAL;
+use quattro_crack::gpu_metrics::GpuMonitor;
 use quattro_crack::plan::{default_plan_order, Plan, Preset};
-use quattro_crack::runner::{self, RunOptions, RunOutcome};
+use quattro_crack::runner::{self, ProgressSink, RunOptions, RunOutcome, StderrSink};
 use quattro_crack::state::{load_plan, load_progress};
+use quattro_crack::tui::{TuiSink, TuiSinkConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,6 +93,14 @@ enum Cmd {
         /// Restringe el barrido a este display_id (multi). Marca el resto como completas.
         #[arg(long, value_name = "ID")]
         only_config: Vec<String>,
+
+        /// Fuerza salida tipo Fase 4 a stderr aunque haya TTY (útil para CI/scripts).
+        #[arg(long)]
+        no_tui: bool,
+
+        /// Directorio donde se escriben los logs (`run-YYYYMMDD-HHMMSS.log`).
+        #[arg(long, default_value = "./logs")]
+        log_dir: PathBuf,
     },
 
     /// Borra `state/plan.toml`, `state/progress.toml` y sus `.bak`. Pide
@@ -138,16 +150,22 @@ fn main() -> Result<()> {
             force_resume,
             skip_config,
             only_config,
-        } => run_cmd(RunOptions {
-            input_path: input,
-            state_dir,
-            batch_size,
-            preset: preset.into(),
-            resume,
-            force_resume,
-            skip_configs: skip_config,
-            only_configs: only_config,
-        }),
+            no_tui,
+            log_dir,
+        } => run_cmd(
+            RunOptions {
+                input_path: input,
+                state_dir,
+                batch_size,
+                preset: preset.into(),
+                resume,
+                force_resume,
+                skip_configs: skip_config,
+                only_configs: only_config,
+            },
+            no_tui,
+            &log_dir,
+        ),
         Cmd::Reset { state_dir, yes } => reset_cmd(&state_dir, yes),
     }
 }
@@ -268,11 +286,36 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run_cmd(opts: RunOptions) -> Result<()> {
+fn run_cmd(opts: RunOptions, no_tui: bool, log_dir: &Path) -> Result<()> {
+    let _tracing_guard = init_tracing(log_dir).context("inicializando tracing")?;
+
     let stop = Arc::new(AtomicBool::new(false));
     quattro_crack::signal::install(Arc::clone(&stop)).context("instalando signal handlers")?;
 
-    let outcome = runner::run(opts, stop)?;
+    let use_tui = !no_tui && io::stdout().is_terminal();
+
+    let sink: Arc<dyn ProgressSink> = if use_tui {
+        Arc::new(TuiSink::new(TuiSinkConfig {
+            n_total_candidates: N_TOTAL,
+            project_version: env!("CARGO_PKG_VERSION").into(),
+        }))
+    } else {
+        Arc::new(StderrSink::new())
+    };
+
+    // GPU monitor (NVML) — sólo si la TUI está activa; con stderr es ruido.
+    let _gpu_monitor = if use_tui {
+        Some(GpuMonitor::start(Arc::clone(&sink)))
+    } else {
+        None
+    };
+
+    let outcome = runner::run(opts, sink.as_ref(), stop)?;
+    // Drop del sink ⇒ join del renderer / monitor antes de imprimir el resumen
+    // a stdout. Lo soltamos aquí explícito para garantizar el orden.
+    drop(_gpu_monitor);
+    drop(sink);
+
     match outcome {
         RunOutcome::Found { hit, elapsed_secs } => {
             println!("HIT  pw='{}' idx={} cfg={} elapsed={:.2}s",
@@ -291,6 +334,33 @@ fn run_cmd(opts: RunOptions) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn init_tracing(log_dir: &Path) -> Result<WorkerGuard> {
+    std::fs::create_dir_all(log_dir)?;
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let path = log_dir.join(format!("run-{ts}.log"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("abriendo log {}", path.display()))?;
+    let (writer, guard) = tracing_appender::non_blocking(file);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .compact()
+        .init();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        log = %path.display(),
+        "tracing initialized"
+    );
+    Ok(guard)
 }
 
 fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {

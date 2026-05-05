@@ -3,13 +3,14 @@
 Brute-force CUDA contra **AES-CBC + PKCS7** con MD5 + estructura de password
 conocida.
 
-> Estado: **Fase 4 completada**. Runner GPU completo con persistencia
-> atómica al final de cada batch, manejo limpio de SIGINT/SIGTERM,
-> reanudación verificada (incluyendo SHA-256 del input), validación
-> PKCS7 del último bloque del ciphertext real, y abort crítico en
-> Pkcs7Mismatch. Throughput sostenido: ~1.2 GH/s en RTX 5070 Ti
-> (deuda de Fase 6, ver `DECISIONS.md` D-012). Sin TUI todavía
-> (Fase 5).
+> Estado: **Fase 5 completada**. TUI en vivo desacoplada del runner por
+> canal `crossbeam_channel::unbounded` (D-019). Runner emite
+> `ProgressEvent`; dos sinks intercambiables: `StderrSink` (replica
+> Fase 4 línea a línea) y `TuiSink` (`indicatif` + `crossterm` con
+> Plan/Space/Speed bars y métricas NVML). Auto-detect TTY con
+> `std::io::IsTerminal` (D-020). Logs estructurados (compact, D-018)
+> a `./logs/run-*.log` vía `tracing-appender`. Throughput intacto a
+> ~1.2 GH/s — deuda de Fase 6 (D-012).
 
 ## Estructura del password objetivo
 
@@ -122,8 +123,47 @@ medición actual de Fase 3 (~1.2 GH/s); Fase 6 cierra el gap.
 - [x] Fase 2 — KDFs + descifrado CPU + plan + estado atómico + CLI ampliada
 - [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/192/256, brute parametrizado)
 - [x] Fase 4 — runner + checkpointing + reanudación + signal handling
-- [ ] Fase 5 — TUI en vivo
+- [x] Fase 5 — TUI en vivo + tracing-appender (logs/) + auto-TTY
 - [ ] Fase 6 — optimización (warp-cooperative AES, MD5 vectorizado)
+
+## Uso interactivo (Fase 5)
+
+```bash
+# Con TTY: TUI en vivo (5 Hz, métricas NVML, ETA, peak/avg GH/s).
+quattro-crack run --preset canonical
+
+# Sin TUI (forzado): formato Fase 4 a stderr. Útil para CI / scripts.
+quattro-crack run --preset canonical --no-tui
+
+# Logs estructurados (compact, sin colores) a fichero por sesión.
+quattro-crack run --log-dir ./mis-logs    # default: ./logs/
+
+# Auto-detección: si stdout está redirigido (pipe, fichero), cae
+# automáticamente a StderrSink aunque no se pase --no-tui.
+quattro-crack run --preset canonical | tee salida.log
+```
+
+### Layout de la TUI
+
+```
+quattro-crack v0.x — N = 59559806250000 — AES-CBC (PKCS7), confirmed
+device: NVIDIA GeForce RTX 5070 Ti  ·  batch_size: 16777216  ·  configs: 42
+
+[Plan]   ████████░░░░░░░░░░░░░░░░░░░░░░░░  3/42 configurations  ·  preset: exhaustive
+[Config] md5_utf16le / cbc / first16  ·  AES-128
+[Space]  ████████████████░░░░░░░░░░░░░░░░  62.4000%  3.71e13/5.96e13  ·  ETA 41m22s
+[Speed]  ████████████████████████░░░░░░░░  1.18 GH/s  (peak 1.24, avg 1.16)
+[GPU]    util 98%  ·  mem 4.1/16.0 GB  ·  temp 71°C  ·  power 218W
+[State]  last flush 0.4s ago  ·  next_step 38712445312
+                                                                       Hits found: 0
+                                          Elapsed (config): 1h12m  ·  Elapsed (total): 4h08m  ·  Configs left: 39
+                                                          Press Ctrl+C to pause and save state safely.
+```
+
+Cuando NVML no inicializa (driver muy nuevo o WSL2 con limitaciones),
+la línea `[GPU]` se sustituye por `metrics unavailable (<reason>)` y el
+barrido sigue intacto. Drop de `TuiSink` restaura cursor + colores
+incluso si la TUI cae a media pintada.
 
 ## Build CUDA
 

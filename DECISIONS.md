@@ -437,3 +437,82 @@ Si pasan los tres → `Confirmed`. Si falla (3) tras pasar (1)+(2) →
 
 El runner persiste el plaintext completo en hex en `Hit::plaintext_hex`
 antes de salir, para auditoría.
+
+---
+
+## D-018 — Logs estructurados a fichero en formato `compact` de tracing
+
+**Contexto** (Fase 5): la TUI vive en stdout; los logs detallados van
+a `./logs/run-YYYYMMDD-HHMMSS.log` para inspección post-mortem.
+
+**Opciones consideradas**:
+
+- **JSON**: máxima compatibilidad con tooling (jq, ELK). Coste:
+  legibilidad humana baja, hay que pasar por `jq` para cualquier ojeo.
+- **pretty (multi-line)**: legibilidad humana alta. Coste: difícil
+  de grepear (un evento ocupa varias líneas).
+- **compact (single-line con campos K=V)**: legible (`grep` directo),
+  parseable razonablemente, y default de `tracing-subscriber::fmt`
+  cuando se llama `.compact()`.
+
+**Decisión**: `compact`, sin ANSI (los ficheros no necesitan colores),
+sin target (`with_target(false)`), filtro `RUST_LOG` o `info` por
+defecto.
+
+Justificación: usuario único / proyecto académico. La pre-condición
+"si en el futuro hace falta JSON, basta con cambiar `.compact()` por
+`.json()` y nada más" la cumplimos.
+
+---
+
+## D-019 — TUI desacoplada por canal `crossbeam_channel::unbounded`
+
+**Contexto**: el contrato de Fase 5 exige que la TUI **no** acople al
+runner. Si la TUI cae, el runner sigue. Si el canal se llena, el
+runner no espera.
+
+**Opciones**:
+
+- `Arc<Mutex<TuiState>>`: simple, pero el runner toma lock cada
+  evento → contención y bloqueos potenciales.
+- `tokio::sync::broadcast`: pensada para varios consumidores; trae
+  toda la maquinaria async para un caso síncrono.
+- `crossbeam_channel::bounded(N)`: backpressure, pero el runner
+  podría bloquear con la TUI lenta.
+- **`crossbeam_channel::unbounded`**: el runner llama `try_send`
+  (no bloquea jamás), el renderer consume a su ritmo. Memoria
+  acotada en la práctica porque el renderer corre a 5 Hz y los
+  batches a 0.1–10 Hz: el canal nunca acumula más de unos pocos
+  eventos.
+
+**Decisión**: `crossbeam_channel::unbounded`. `TuiSink::on_event`
+hace `self.tx.try_send(event)` y descarta silenciosamente si el canal
+está desconectado (renderer ya salió tras `PlanCompleted`/`Paused`).
+
+---
+
+## D-020 — Auto-detect TUI con `std::io::IsTerminal`
+
+**Contexto**: `quattro-crack run` debe usar TUI cuando hay TTY y
+caer a `StderrSink` cuando stdout está redirigido (pipes, ficheros,
+CI). La spec menciona `atty` o `is-terminal`.
+
+**Opciones**:
+
+- `atty` crate: clásico, no mantenido desde 2021.
+- `is-terminal` crate: bien mantenido, sin warnings de seguridad.
+- **`std::io::IsTerminal`** (estable desde Rust 1.70): cero deps,
+  exactamente la API que necesito.
+
+**Decisión**: `std::io::IsTerminal::is_terminal(&io::stdout())`.
+Combinado con `--no-tui` (override forzoso), el comportamiento es:
+
+```text
+no_tui flag  TTY  →  sink usado
+─────────────────────────────────
+true         *    →  StderrSink   (override explícito)
+false        no   →  StderrSink   (auto)
+false        yes  →  TuiSink      (auto)
+```
+
+Sin dependencia externa nueva — Rust 1.95 lo soporta nativamente.

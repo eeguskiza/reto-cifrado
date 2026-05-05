@@ -17,14 +17,20 @@
 //!   final de cada batch; si está set, persiste y sale con
 //!   `RunOutcome::Paused`.
 //!
-//! No hay TUI (Fase 5). Logs simples a `stderr`.
+//! **Salida desacoplada (Fase 5)**: el runner no hace `eprintln!`;
+//! emite `ProgressEvent` por un `ProgressSink`. Dos implementaciones:
+//! `StderrSink` (replica el formato de Fase 4 línea a línea) y
+//! `TuiSink` (en `src/tui.rs`, render con `indicatif`). Tracing va en
+//! paralelo a fichero (configurado en `main.rs`).
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use tracing::{debug, error, info, warn};
 
 use crate::ciphertext::Ciphertext;
 use crate::combinatorics::{index_to_password, N};
@@ -40,6 +46,326 @@ use crate::state::{
 /// Path basenames bajo `state_dir`.
 pub const PLAN_BASENAME: &str = "plan.toml";
 pub const PROGRESS_BASENAME: &str = "progress.toml";
+
+// ============================================================================
+// ProgressSink trait + ProgressEvent enum
+// ============================================================================
+
+/// Sink al que el runner envía eventos. Las implementaciones concretas
+/// (`StderrSink`, `TuiSink`) deciden cómo renderizarlos.
+///
+/// El método `on_event` recibe `&self` para que el sink pueda compartirse
+/// (`Arc<dyn ProgressSink>`) entre el hilo del runner y, p. ej., el hilo
+/// de muestreo NVML. El sink **nunca** debe bloquear: `try_send` o
+/// `unbounded` por debajo, según corresponda. Si un evento se descarta
+/// por backpressure, no es problema del runner.
+pub trait ProgressSink: Send + Sync {
+    fn on_event(&self, event: ProgressEvent);
+}
+
+/// Eventos del runner. Cubre cada punto donde Fase 4 hacía `eprintln!`,
+/// más métricas externas (NVML) y eventos para diagnóstico.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Plan listo; runner a punto de empezar a iterar configs.
+    PlanLoaded {
+        total_configs: usize,
+        total_candidates: u64,
+        source_sha256: String,
+        preset_name: Option<String>,
+        batch_size: u32,
+        device_name: String,
+    },
+    /// Reanudación: el plan estaba previamente cargado y partimos de
+    /// `from_step` en `config_idx`.
+    Resumed {
+        config_idx: usize,
+        from_step: u64,
+    },
+    /// Reanudación rechazada (sha256 distinto, versión incompatible, etc.).
+    /// Se emite ANTES de devolver el `Err` correspondiente.
+    ResumeRejected {
+        reason: String,
+    },
+    /// El runner empieza a procesar la config `idx`.
+    ConfigStarted {
+        idx: usize,
+        total: usize,
+        kdf: String,
+        iv: String,
+        klen: usize,
+        start_step: u64,
+    },
+    /// Un batch acaba de terminar. Persistencia atómica YA aplicada.
+    BatchCompleted {
+        config_idx: usize,
+        batch_num: u64,
+        current_step: u64,
+        candidates_in_batch: u64,
+        batch_duration_ms: u64,
+    },
+    /// Métrica NVML (sólo si la TUI lo pidió).
+    GpuSample {
+        utilization_pct: u8,
+        memory_used_mb: u64,
+        memory_total_mb: u64,
+        temperature_c: u8,
+        power_w: u32,
+    },
+    /// NVML no se pudo inicializar; el runner sigue funcionando.
+    GpuMetricsUnavailable {
+        reason: String,
+    },
+    /// Hit confirmado tras los 3 pasos (kernel + CPU + PKCS7).
+    HitConfirmed {
+        config_idx: usize,
+        kdf: String,
+        password: String,
+        idx: u64,
+        plaintext_hex_first_32: String,
+        elapsed_total: Duration,
+    },
+    /// Falso positivo del kernel descartado en CPU (prefijo de 32 B falla).
+    /// Esperado a ratio ~2⁻¹²⁸; útil para diagnóstico de tasa.
+    HitDiscardedPrefixMismatch {
+        config_idx: usize,
+        idx: u64,
+    },
+    /// EVENTO CRÍTICO: prefijo de 32 B coincide pero PKCS7 falla.
+    /// El runner ABORTA tras emitir esto.
+    HitCriticalPkcs7Mismatch {
+        config_idx: usize,
+        idx: u64,
+        password: String,
+    },
+    /// SIGINT/SIGTERM recibido y batch en curso terminado.
+    Paused {
+        config_idx: usize,
+        last_step: u64,
+        elapsed_total: Duration,
+    },
+    /// La config `idx` se completó (alcanzó N o estaba marcada como skip).
+    ConfigCompleted {
+        idx: usize,
+        candidates_processed: u64,
+        duration: Duration,
+        hits: usize,
+    },
+    /// Plan completado: todas las configs barridas sin hit confirmado.
+    PlanCompleted {
+        total_hits: usize,
+        elapsed_total: Duration,
+    },
+}
+
+// ============================================================================
+// StderrSink — replica formato de Fase 4 (los tests existentes lo dependen)
+// ============================================================================
+
+/// Sink que escribe a stderr con el formato exacto de Fase 4. Default
+/// fallback cuando stdout no es TTY o cuando se pasa `--no-tui`.
+///
+/// Genérico sobre el writer para facilitar tests (vía `Arc<Mutex<Vec<u8>>>`).
+pub struct StderrSink<W: Write + Send> {
+    writer: Arc<Mutex<W>>,
+}
+
+impl StderrSink<std::io::Stderr> {
+    pub fn new() -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(std::io::stderr())),
+        }
+    }
+}
+
+impl Default for StderrSink<std::io::Stderr> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<W: Write + Send> StderrSink<W> {
+    pub fn from_writer(w: W) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(w)),
+        }
+    }
+}
+
+impl<W: Write + Send> ProgressSink for StderrSink<W>
+where
+    W: 'static,
+{
+    fn on_event(&self, event: ProgressEvent) {
+        // Bloqueo del writer SOLO mientras formateamos. Con `eprintln!`
+        // no había bloqueo explícito (lo gestiona stderr), así que aquí
+        // mantenemos el comportamiento equivalente.
+        let mut w = match self.writer.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match event {
+            ProgressEvent::PlanLoaded {
+                total_configs,
+                preset_name,
+                batch_size,
+                device_name,
+                ..
+            } => {
+                let preset_dbg = match preset_name {
+                    Some(name) => format!("Some({})", capitalize(&name)),
+                    None => "None".to_string(),
+                };
+                let _ = writeln!(
+                    w,
+                    "device: {device_name}\nplan: {total_configs} entries (preset {preset_dbg}), batch_size {batch_size}"
+                );
+            }
+            ProgressEvent::ConfigStarted {
+                idx,
+                total,
+                kdf,
+                iv,
+                klen,
+                start_step,
+            } => {
+                let _ = writeln!(
+                    w,
+                    "[cfg {}/{}] {}/cbc/{} (klen {} B), arranca en idx {}",
+                    idx + 1,
+                    total,
+                    kdf,
+                    iv,
+                    klen,
+                    start_step
+                );
+            }
+            ProgressEvent::BatchCompleted {
+                config_idx,
+                batch_num,
+                current_step,
+                candidates_in_batch,
+                batch_duration_ms,
+            } => {
+                if batch_num % 10 == 0 {
+                    let cfg_pct = 100.0 * (current_step as f64) / (N as f64);
+                    let ghs = if batch_duration_ms > 0 {
+                        candidates_in_batch as f64 / (batch_duration_ms as f64 / 1000.0) / 1.0e9
+                    } else {
+                        0.0
+                    };
+                    // Fase 4 usaba `next_step` ANTES del incremento como índice
+                    // mostrado. Aquí `current_step` ya está incrementado, así
+                    // que mostramos el inicio del batch terminado.
+                    let shown_idx = current_step.saturating_sub(candidates_in_batch);
+                    let _ = writeln!(
+                        w,
+                        "  cfg {}/?: batch #{:>5} idx={:>15} ({:.4}% del cfg) {:.2} GH/s",
+                        config_idx + 1,
+                        batch_num,
+                        shown_idx,
+                        cfg_pct,
+                        ghs
+                    );
+                }
+            }
+            ProgressEvent::HitConfirmed {
+                kdf,
+                password,
+                idx,
+                plaintext_hex_first_32,
+                elapsed_total,
+                ..
+            } => {
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+                let _ = writeln!(
+                    w,
+                    "  HIT CONFIRMADO  cfg={}/cbc/?  idx={}  pw='{}'",
+                    kdf, idx, password
+                );
+                let _ = writeln!(
+                    w,
+                    "  elapsed={:.2}s   plaintext[..32]={}",
+                    elapsed_total.as_secs_f64(),
+                    plaintext_hex_first_32
+                );
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+            }
+            ProgressEvent::HitCriticalPkcs7Mismatch {
+                config_idx,
+                idx,
+                password,
+            } => {
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+                let _ = writeln!(
+                    w,
+                    "CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO en idx={} cfg={} pw='{}'",
+                    idx, config_idx, password
+                );
+                let _ = writeln!(w, "Probabilidad bajo CBC+PKCS7 real: ~2^-130 → casi seguro un BUG.");
+                let _ = writeln!(w, "Posibles causas: KDF rota / kernel rota / ciphertext corrupto.");
+                let _ = writeln!(w, "ABORTANDO el barrido. Estado guardado para inspección.");
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+            }
+            ProgressEvent::Paused {
+                last_step,
+                elapsed_total,
+                ..
+            } => {
+                let _ = writeln!(
+                    w,
+                    "[pausa] elapsed={:.2}s; estado guardado en progress.toml. \
+                     Reanuda con `quattro-crack run --resume`. last_step={}",
+                    elapsed_total.as_secs_f64(),
+                    last_step
+                );
+            }
+            ProgressEvent::ConfigCompleted { idx, .. } => {
+                let _ = writeln!(w, "[cfg {}/?] completada", idx + 1);
+            }
+            ProgressEvent::PlanCompleted { elapsed_total, .. } => {
+                let _ = writeln!(
+                    w,
+                    "plan completado SIN hit confirmado ({:.2}s)",
+                    elapsed_total.as_secs_f64()
+                );
+            }
+            ProgressEvent::ResumeRejected { reason } => {
+                let _ = writeln!(w, "resume rechazado: {reason}");
+            }
+            // Eventos sólo informativos para la TUI; en stderr son ruido.
+            ProgressEvent::Resumed { .. }
+            | ProgressEvent::GpuSample { .. }
+            | ProgressEvent::GpuMetricsUnavailable { .. }
+            | ProgressEvent::HitDiscardedPrefixMismatch { .. } => {}
+        }
+        let _ = w.flush();
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().chain(c).collect(),
+    }
+}
+
+// ============================================================================
+// run()
+// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
@@ -67,7 +393,11 @@ pub enum RunOutcome {
     },
 }
 
-pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
+pub fn run(
+    opts: RunOptions,
+    sink: &dyn ProgressSink,
+    stop: Arc<AtomicBool>,
+) -> Result<RunOutcome> {
     let plan_path = opts.state_dir.join(PLAN_BASENAME);
     let progress_path = opts.state_dir.join(PROGRESS_BASENAME);
 
@@ -79,33 +409,46 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
     // ---------- 2. Construir/cargar plan ----------
     let plan = if opts.resume {
         if !plan_path.exists() {
-            bail!(
+            let reason = format!(
                 "no hay sesión previa para reanudar (no existe {}). \
                  Lanza sin --resume para crear un plan nuevo.",
                 plan_path.display()
             );
+            sink.on_event(ProgressEvent::ResumeRejected {
+                reason: reason.clone(),
+            });
+            error!("{reason}");
+            bail!(reason);
         }
         let plan =
             load_plan(&plan_path).with_context(|| format!("cargando {}", plan_path.display()))?;
 
         if plan.source_sha256 != sha_hex {
-            bail!(
+            let reason = format!(
                 "el fichero objetivo ha cambiado desde la sesión guardada\n  \
                  esperado sha256: {}\n  \
                  actual sha256:   {}\n\
                  Lanza --reset para empezar de nuevo, o repón el fichero original.",
-                plan.source_sha256,
-                sha_hex
+                plan.source_sha256, sha_hex
             );
+            sink.on_event(ProgressEvent::ResumeRejected {
+                reason: reason.clone(),
+            });
+            error!(expected = %plan.source_sha256, actual = %sha_hex, "resume rejected: sha256 mismatch");
+            bail!(reason);
         }
         let curr = env!("CARGO_PKG_VERSION");
         if !opts.force_resume && !same_major(&plan.program_version, curr) {
-            bail!(
+            let reason = format!(
                 "la versión guardada ({}) no es compatible con la actual ({}). \
                  Pasa --force-resume si confías en la migración.",
-                plan.program_version,
-                curr
+                plan.program_version, curr
             );
+            sink.on_event(ProgressEvent::ResumeRejected {
+                reason: reason.clone(),
+            });
+            error!(saved = %plan.program_version, current = %curr, "resume rejected: version mismatch");
+            bail!(reason);
         }
         plan
     } else {
@@ -125,12 +468,11 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
     let mut progress = if opts.resume {
         match load_progress_with_bak(&progress_path) {
             Ok(p) => {
-                // Sanity: longitud del vector debe coincidir con plan.
                 if p.per_config.len() != plan.entries.len() {
-                    eprintln!(
-                        "warning: per_config tenía {} entries pero plan tiene {}; reseteando progreso",
-                        p.per_config.len(),
-                        plan.entries.len()
+                    warn!(
+                        loaded = p.per_config.len(),
+                        expected = plan.entries.len(),
+                        "per_config mismatch, reseteando progreso"
                     );
                     Progress::for_plan(&plan)
                 } else {
@@ -138,12 +480,11 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
                 }
             }
             Err(e) => {
-                eprintln!("warning: no hay progreso recuperable ({e}); arrancando limpio");
+                warn!(error = %e, "no hay progreso recuperable, arrancando limpio");
                 Progress::for_plan(&plan)
             }
         }
     } else {
-        // Fresh: borra cualquier progreso anterior.
         let _ = std::fs::remove_file(&progress_path);
         let _ = std::fs::remove_file(progress_bak_path(&progress_path));
         Progress::for_plan(&plan)
@@ -162,12 +503,32 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
     let device = cuda_ctx
         .device_name()
         .unwrap_or_else(|_| "<unknown>".into());
-    eprintln!(
-        "device: {device}\nplan: {} entries (preset {:?}), batch_size {}",
-        plan.entries.len(),
-        plan.preset,
-        plan.batch_size
+
+    sink.on_event(ProgressEvent::PlanLoaded {
+        total_configs: plan.entries.len(),
+        total_candidates: N,
+        source_sha256: plan.source_sha256.clone(),
+        preset_name: plan.preset.map(|p| p.as_str().to_string()),
+        batch_size: plan.batch_size,
+        device_name: device.clone(),
+    });
+    info!(
+        configs = plan.entries.len(),
+        device = %device,
+        batch_size = plan.batch_size,
+        "plan loaded"
     );
+
+    if opts.resume {
+        sink.on_event(ProgressEvent::Resumed {
+            config_idx: progress.current_config,
+            from_step: progress
+                .per_config
+                .get(progress.current_config)
+                .map(|p| p.next_step)
+                .unwrap_or(0),
+        });
+    }
 
     // ---------- 6. Bucle principal ----------
     let started = Instant::now();
@@ -177,18 +538,33 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
         let cfg: ConfigEntry = plan.entries[cfg_idx];
         if progress.per_config[cfg_idx].next_step >= N {
             // Ya completada (o marcada por skip/only).
+            sink.on_event(ProgressEvent::ConfigCompleted {
+                idx: cfg_idx,
+                candidates_processed: progress.per_config[cfg_idx].tried,
+                duration: Duration::from_micros(progress.per_config[cfg_idx].elapsed_us),
+                hits: 0,
+            });
             continue;
         }
         progress.current_config = cfg_idx;
 
+        let cfg_started_at = Instant::now();
         let start_idx = progress.per_config[cfg_idx].next_step;
-        eprintln!(
-            "[cfg {}/{}] {} (klen {} B), arranca en idx {}",
-            cfg_idx + 1,
-            total_configs,
-            cfg.display_id(),
-            cfg.key_len_bytes(),
-            start_idx
+
+        sink.on_event(ProgressEvent::ConfigStarted {
+            idx: cfg_idx,
+            total: total_configs,
+            kdf: cfg.kdf.as_str().to_string(),
+            iv: cfg.iv.as_str().to_string(),
+            klen: cfg.key_len_bytes(),
+            start_step: start_idx,
+        });
+        info!(
+            idx = cfg_idx,
+            cfg = %cfg.display_id(),
+            klen = cfg.key_len_bytes(),
+            start = start_idx,
+            "config started"
         );
 
         let mut bundle = KernelBundle::load(&cuda_ctx, cfg.kdf)
@@ -201,23 +577,25 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
         };
         let ct_block_0: [u8; 16] = *ct.ct_first_block();
         let mut batches_run: u64 = 0;
+        let cfg_hits_at_start = progress.hits.len();
 
         loop {
             // Stop flag — se respeta entre batches, no a media GPU.
             if stop.load(Ordering::SeqCst) {
                 progress.last_flush_utc = utc_now();
                 save_progress_with_bak(&progress_path, &progress)?;
-                let elapsed = started.elapsed().as_secs_f64();
-                eprintln!(
-                    "[pausa] elapsed={:.2}s; estado guardado en {}. \
-                     Reanuda con `quattro-crack run --resume`.",
-                    elapsed,
-                    progress_path.display()
-                );
+                let elapsed = started.elapsed();
+                let last_step = progress.per_config[cfg_idx].next_step;
+                sink.on_event(ProgressEvent::Paused {
+                    config_idx: cfg_idx,
+                    last_step,
+                    elapsed_total: elapsed,
+                });
+                warn!(elapsed_s = elapsed.as_secs_f64(), last_step, "paused");
                 return Ok(RunOutcome::Paused {
-                    elapsed_secs: elapsed,
+                    elapsed_secs: elapsed.as_secs_f64(),
                     last_config: cfg_idx,
-                    last_step: progress.per_config[cfg_idx].next_step,
+                    last_step,
                 });
             }
 
@@ -240,9 +618,6 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
                 })?;
             let batch_elapsed = batch_started.elapsed();
 
-            // Avanza puntero ANTES de validar hits (next_step indica el
-            // siguiente idx NO probado; el batch que acaba de terminar
-            // ya cubre [next_step, next_step + idx_count)).
             progress.per_config[cfg_idx].next_step = next_step + idx_count;
             progress.per_config[cfg_idx].tried += idx_count;
             progress.per_config[cfg_idx].elapsed_us += batch_elapsed.as_micros() as u64;
@@ -268,49 +643,60 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
                     .context("validate_hit")?;
                 match verdict {
                     HitVerdict::Confirmed { plaintext } => {
+                        let pw_str = std::str::from_utf8(pw_utf8)
+                            .unwrap_or("<no utf8>")
+                            .to_string();
+                        let pt_hex = hex::encode(&plaintext);
+                        let pt_first_32 = pt_hex
+                            .get(..64)
+                            .unwrap_or(pt_hex.as_str())
+                            .to_string();
                         let hit = Hit {
                             idx: dh.idx,
                             config: cfg,
-                            password: std::str::from_utf8(pw_utf8)
-                                .unwrap_or("<no utf8>")
-                                .to_string(),
-                            plaintext_hex: hex::encode(&plaintext),
+                            password: pw_str.clone(),
+                            plaintext_hex: pt_hex,
                             when_utc: utc_now(),
                         };
                         progress.hits.push(hit.clone());
                         progress.last_flush_utc = utc_now();
                         save_progress_with_bak(&progress_path, &progress)?;
-                        let elapsed = started.elapsed().as_secs_f64();
-                        eprintln!("================================================================");
-                        eprintln!(
-                            "  HIT CONFIRMADO  cfg={}  idx={}  pw='{}'",
-                            cfg.display_id(),
-                            hit.idx,
-                            hit.password
+                        let elapsed = started.elapsed();
+                        sink.on_event(ProgressEvent::HitConfirmed {
+                            config_idx: cfg_idx,
+                            kdf: cfg.kdf.as_str().to_string(),
+                            password: pw_str.clone(),
+                            idx: dh.idx,
+                            plaintext_hex_first_32: pt_first_32,
+                            elapsed_total: elapsed,
+                        });
+                        info!(
+                            cfg = %cfg.display_id(),
+                            idx = dh.idx,
+                            pw = %pw_str,
+                            elapsed_s = elapsed.as_secs_f64(),
+                            "HIT CONFIRMED"
                         );
-                        eprintln!(
-                            "  elapsed={:.2}s   plaintext[..32]={}",
-                            elapsed,
-                            &hit.plaintext_hex[..64.min(hit.plaintext_hex.len())]
-                        );
-                        eprintln!("================================================================");
                         return Ok(RunOutcome::Found {
                             hit,
-                            elapsed_secs: elapsed,
+                            elapsed_secs: elapsed.as_secs_f64(),
                         });
                     }
                     HitVerdict::Pkcs7Mismatch { .. } => {
-                        // CRITICAL — D-007: ~2^-130 bajo CBC+PKCS7 real.
-                        eprintln!("================================================================");
-                        eprintln!(
-                            "CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO en idx={} cfg={}",
-                            dh.idx,
-                            cfg.display_id()
+                        let pw_str = std::str::from_utf8(pw_utf8)
+                            .unwrap_or("<no utf8>")
+                            .to_string();
+                        sink.on_event(ProgressEvent::HitCriticalPkcs7Mismatch {
+                            config_idx: cfg_idx,
+                            idx: dh.idx,
+                            password: pw_str.clone(),
+                        });
+                        error!(
+                            cfg = %cfg.display_id(),
+                            idx = dh.idx,
+                            pw = %pw_str,
+                            "CRITICAL: prefijo-32 OK pero PKCS7 inválido"
                         );
-                        eprintln!("Probabilidad bajo CBC+PKCS7 real: ~2^-130 → casi seguro un BUG.");
-                        eprintln!("Posibles causas: KDF rota / kernel rota / ciphertext corrupto.");
-                        eprintln!("ABORTANDO el barrido. Estado guardado para inspección.");
-                        eprintln!("================================================================");
                         progress.last_flush_utc = utc_now();
                         save_progress_with_bak(&progress_path, &progress)?;
                         return Err(anyhow!(
@@ -320,7 +706,11 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
                         ));
                     }
                     HitVerdict::PrefixMismatch32 => {
-                        // Falso positivo del kernel (~2^-128 por candidata). Continuar.
+                        sink.on_event(ProgressEvent::HitDiscardedPrefixMismatch {
+                            config_idx: cfg_idx,
+                            idx: dh.idx,
+                        });
+                        debug!(idx = dh.idx, "kernel false positive (prefix32 mismatch)");
                     }
                 }
             }
@@ -329,37 +719,49 @@ pub fn run(opts: RunOptions, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
             progress.last_flush_utc = utc_now();
             save_progress_with_bak(&progress_path, &progress)?;
 
-            // Log periódico (cada 10 batches).
-            if batches_run % 10 == 0 {
-                let cfg_pct = 100.0 * (next_step + idx_count) as f64 / N as f64;
-                let ghs = idx_count as f64 / batch_elapsed.as_secs_f64() / 1.0e9;
-                eprintln!(
-                    "  cfg {}/{}: batch #{:>5} idx={:>15} ({:.4}% del cfg) {:.2} GH/s",
-                    cfg_idx + 1,
-                    total_configs,
-                    batches_run,
-                    next_step,
-                    cfg_pct,
-                    ghs
+            sink.on_event(ProgressEvent::BatchCompleted {
+                config_idx: cfg_idx,
+                batch_num: batches_run,
+                current_step: progress.per_config[cfg_idx].next_step,
+                candidates_in_batch: idx_count,
+                batch_duration_ms: batch_elapsed.as_millis() as u64,
+            });
+            if batches_run % 50 == 0 {
+                debug!(
+                    cfg = cfg_idx,
+                    batch = batches_run,
+                    next_step = progress.per_config[cfg_idx].next_step,
+                    "batch completed"
                 );
             }
         }
 
-        eprintln!(
-            "[cfg {}/{}] {} completada",
-            cfg_idx + 1,
-            total_configs,
-            cfg.display_id()
-        );
+        let cfg_duration = cfg_started_at.elapsed();
+        let cfg_hits = progress.hits.len() - cfg_hits_at_start;
+        sink.on_event(ProgressEvent::ConfigCompleted {
+            idx: cfg_idx,
+            candidates_processed: progress.per_config[cfg_idx].tried,
+            duration: cfg_duration,
+            hits: cfg_hits,
+        });
+        info!(idx = cfg_idx, hits = cfg_hits, "config completed");
     }
 
     // Plan completado sin hit.
     progress.last_flush_utc = utc_now();
     save_progress_with_bak(&progress_path, &progress)?;
-    let elapsed = started.elapsed().as_secs_f64();
-    eprintln!("plan completado SIN hit confirmado ({:.2}s)", elapsed);
+    let elapsed = started.elapsed();
+    sink.on_event(ProgressEvent::PlanCompleted {
+        total_hits: progress.hits.len(),
+        elapsed_total: elapsed,
+    });
+    info!(
+        elapsed_s = elapsed.as_secs_f64(),
+        hits = progress.hits.len(),
+        "plan completed without confirmed hit"
+    );
     Ok(RunOutcome::Completed {
-        elapsed_secs: elapsed,
+        elapsed_secs: elapsed.as_secs_f64(),
     })
 }
 
@@ -400,7 +802,7 @@ fn utc_now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn progress_bak_path(path: &std::path::Path) -> PathBuf {
+fn progress_bak_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".bak");
     PathBuf::from(s)

@@ -23,14 +23,21 @@ cbc = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 cipher = "0.4"
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+crossterm = "0.28"
 cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "cuda-version-from-build-system", "dynamic-loading"] }
 hex = "0.4"
+indicatif = "0.17"
 md-5 = "0.10"
+nvml-wrapper = "0.10"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 signal-hook = "0.3"
 thiserror = "1"
 toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 
 [build-dependencies]
 anyhow = "1"
