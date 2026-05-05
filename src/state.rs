@@ -180,6 +180,49 @@ pub fn load_progress(path: &Path) -> Result<Progress, StateError> {
     Ok(toml::from_str(text)?)
 }
 
+/// Path para el backup `<path>.bak`.
+fn bak_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".bak");
+    PathBuf::from(s)
+}
+
+/// Como `save_progress` pero rota el `<path>.toml` actual a `<path>.toml.bak`
+/// antes de escribir el nuevo. Si el flush actual se corrompe (ej. corte
+/// de luz post-fsync), `load_progress_with_bak` puede recuperar el flush
+/// inmediatamente anterior.
+pub fn save_progress_with_bak(path: &Path, progress: &Progress) -> Result<(), StateError> {
+    if path.exists() {
+        let bak = bak_path(path);
+        // Mejor esfuerzo: si el copy falla (FS lleno, permisos), seguimos
+        // con el flush principal. La pérdida del .bak es aceptable; la
+        // pérdida del .toml no.
+        let _ = fs::copy(path, &bak);
+    }
+    save_progress(path, progress)
+}
+
+/// Como `load_progress` pero, si el principal está corrupto o ausente,
+/// intenta `<path>.bak`.
+pub fn load_progress_with_bak(path: &Path) -> Result<Progress, StateError> {
+    match load_progress(path) {
+        Ok(p) => Ok(p),
+        Err(primary_err) => {
+            let bak = bak_path(path);
+            if bak.exists() {
+                eprintln!(
+                    "warning: {} corrupto/ausente ({primary_err}); cargando {}",
+                    path.display(),
+                    bak.display()
+                );
+                load_progress(&bak)
+            } else {
+                Err(primary_err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +282,63 @@ mod tests {
         assert_eq!(loaded.entries, plan.entries);
         assert_eq!(loaded.batch_size, plan.batch_size);
         assert_eq!(loaded.preset, plan.preset);
+    }
+
+    #[test]
+    fn save_progress_with_bak_rotates_previous_flush() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("progress.toml");
+        let bak = tmp.path().join("progress.toml.bak");
+
+        let plan = Plan::from_preset(
+            "0.1.0",
+            "/tmp/cifrado.txt",
+            "deadbeef".repeat(8),
+            crate::plan::Preset::Canonical,
+            16_777_216,
+        )
+        .unwrap();
+
+        let mut p1 = Progress::for_plan(&plan);
+        p1.per_config[0].next_step = 100;
+        save_progress_with_bak(&path, &p1).unwrap();
+        assert!(path.exists());
+        assert!(!bak.exists(), "primer flush no debe crear .bak (no había nada que rotar)");
+
+        let mut p2 = Progress::for_plan(&plan);
+        p2.per_config[0].next_step = 200;
+        save_progress_with_bak(&path, &p2).unwrap();
+        assert!(path.exists());
+        assert!(bak.exists(), "segundo flush DEBE haber rotado el primero a .bak");
+
+        let main = load_progress(&path).unwrap();
+        assert_eq!(main.per_config[0].next_step, 200);
+        let bak_loaded = load_progress(&bak).unwrap();
+        assert_eq!(bak_loaded.per_config[0].next_step, 100);
+    }
+
+    #[test]
+    fn load_progress_with_bak_falls_back_when_main_corrupt() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("progress.toml");
+        let bak = tmp.path().join("progress.toml.bak");
+
+        let plan = Plan::from_preset(
+            "0.1.0",
+            "/tmp/cifrado.txt",
+            "deadbeef".repeat(8),
+            crate::plan::Preset::Canonical,
+            16_777_216,
+        )
+        .unwrap();
+        let p = Progress::for_plan(&plan);
+        save_progress(&bak, &p).unwrap();
+
+        // .toml principal corrupto:
+        fs::write(&path, b"esto no es toml valido =====").unwrap();
+
+        let loaded = load_progress_with_bak(&path).expect("debe caer al .bak");
+        assert_eq!(loaded.per_config.len(), p.per_config.len());
     }
 
     #[test]

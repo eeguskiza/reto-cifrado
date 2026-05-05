@@ -1,10 +1,14 @@
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, CT_LEN, IV_LEN, TOTAL_BIN_LEN};
 use quattro_crack::plan::{default_plan_order, Plan, Preset};
+use quattro_crack::runner::{self, RunOptions, RunOutcome};
 use quattro_crack::state::{load_plan, load_progress};
 
 #[derive(Parser, Debug)]
@@ -50,6 +54,51 @@ enum Cmd {
         #[arg(long, default_value = "./state")]
         state_dir: PathBuf,
     },
+
+    /// Ejecuta el barrido. Persistencia atómica al final de cada batch;
+    /// SIGINT/SIGTERM termina el batch en curso, guarda el estado y sale.
+    Run {
+        /// Ruta al fichero base64 con el ciphertext.
+        #[arg(long, default_value = "./data/cifrado.txt")]
+        input: PathBuf,
+
+        /// Directorio donde viven `plan.toml` y `progress.toml`.
+        #[arg(long, default_value = "./state")]
+        state_dir: PathBuf,
+
+        /// Preset del plan (ignorado si --resume).
+        #[arg(long, value_enum, default_value_t = PresetCli::Exhaustive)]
+        preset: PresetCli,
+
+        /// Tamaño de batch del kernel.
+        #[arg(long, default_value_t = 16_777_216)]
+        batch_size: u32,
+
+        /// Reanuda una sesión previa. Verifica SHA-256 del input.
+        #[arg(long)]
+        resume: bool,
+
+        /// Ignora el chequeo de major version al reanudar (úsalo si sabes lo que haces).
+        #[arg(long)]
+        force_resume: bool,
+
+        /// Marca como completada la config con este display_id (multi).
+        #[arg(long, value_name = "ID")]
+        skip_config: Vec<String>,
+
+        /// Restringe el barrido a este display_id (multi). Marca el resto como completas.
+        #[arg(long, value_name = "ID")]
+        only_config: Vec<String>,
+    },
+
+    /// Borra `state/plan.toml`, `state/progress.toml` y sus `.bak`. Pide
+    /// confirmación interactiva salvo `--yes`.
+    Reset {
+        #[arg(long, default_value = "./state")]
+        state_dir: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -80,6 +129,26 @@ fn main() -> Result<()> {
             save,
         } => plan_cmd(preset.into(), &input, batch_size, save),
         Cmd::Status { state_dir } => status_cmd(&state_dir),
+        Cmd::Run {
+            input,
+            state_dir,
+            preset,
+            batch_size,
+            resume,
+            force_resume,
+            skip_config,
+            only_config,
+        } => run_cmd(RunOptions {
+            input_path: input,
+            state_dir,
+            batch_size,
+            preset: preset.into(),
+            resume,
+            force_resume,
+            skip_configs: skip_config,
+            only_configs: only_config,
+        }),
+        Cmd::Reset { state_dir, yes } => reset_cmd(&state_dir, yes),
     }
 }
 
@@ -198,3 +267,71 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+fn run_cmd(opts: RunOptions) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    quattro_crack::signal::install(Arc::clone(&stop)).context("instalando signal handlers")?;
+
+    let outcome = runner::run(opts, stop)?;
+    match outcome {
+        RunOutcome::Found { hit, elapsed_secs } => {
+            println!("HIT  pw='{}' idx={} cfg={} elapsed={:.2}s",
+                hit.password, hit.idx, hit.config.display_id(), elapsed_secs);
+            Ok(())
+        }
+        RunOutcome::Completed { elapsed_secs } => {
+            println!("DONE  plan completado SIN hit ({:.2}s)", elapsed_secs);
+            Ok(())
+        }
+        RunOutcome::Paused { elapsed_secs, last_config, last_step } => {
+            println!(
+                "PAUSED elapsed={:.2}s  last_config={}  last_step={}",
+                elapsed_secs, last_config, last_step
+            );
+            Ok(())
+        }
+    }
+}
+
+fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {
+    let plan_path = state_dir.join("plan.toml");
+    let progress_path = state_dir.join("progress.toml");
+    let progress_bak = state_dir.join("progress.toml.bak");
+    let plan_bak = state_dir.join("plan.toml.bak");
+
+    let exists_any = plan_path.exists()
+        || progress_path.exists()
+        || progress_bak.exists()
+        || plan_bak.exists();
+    if !exists_any {
+        println!("nada que borrar en {}.", state_dir.display());
+        return Ok(());
+    }
+
+    if !yes {
+        eprintln!("Esto borrará:");
+        for p in [&plan_path, &progress_path, &progress_bak, &plan_bak] {
+            if p.exists() {
+                eprintln!("  {}", p.display());
+            }
+        }
+        eprint!("Continuar? [y/N] ");
+        io::stderr().flush()?;
+        let mut input = String::new();
+        io::stdin().lock().read_line(&mut input)?;
+        let answer = input.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" && answer != "s" && answer != "si" {
+            println!("cancelado.");
+            return Ok(());
+        }
+    }
+
+    for p in [&plan_path, &progress_path, &progress_bak, &plan_bak] {
+        if p.exists() {
+            std::fs::remove_file(p).with_context(|| format!("borrando {}", p.display()))?;
+        }
+    }
+    println!("estado borrado.");
+    Ok(())
+}
+

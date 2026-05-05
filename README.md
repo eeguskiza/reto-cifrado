@@ -3,11 +3,13 @@
 Brute-force CUDA contra **AES-CBC + PKCS7** con MD5 + estructura de password
 conocida.
 
-> Estado: **Fase 3 + Fase 3.5 completadas**. Kernels CUDA con paridad
-> CPU↔GPU validada, MD5 RFC 1321, AES-128/192/256 FIPS-197, 14 KDFs,
-> plan de 42 configs CBC. Throughput sostenido medido: ~1.2 GH/s en
-> RTX 5070 Ti (target spec preliminar 3 GH/s; Fase 6 optimiza —
-> ver `DECISIONS.md` D-012).
+> Estado: **Fase 4 completada**. Runner GPU completo con persistencia
+> atómica al final de cada batch, manejo limpio de SIGINT/SIGTERM,
+> reanudación verificada (incluyendo SHA-256 del input), validación
+> PKCS7 del último bloque del ciphertext real, y abort crítico en
+> Pkcs7Mismatch. Throughput sostenido: ~1.2 GH/s en RTX 5070 Ti
+> (deuda de Fase 6, ver `DECISIONS.md` D-012). Sin TUI todavía
+> (Fase 5).
 
 ## Estructura del password objetivo
 
@@ -102,29 +104,24 @@ cargo run --release -- plan --preset exhaustive --save
 cargo run --release -- status
 ```
 
-Cuando esté Fase 4 lista:
-
-```bash
-quattro-crack run --input ./data/cifrado.txt --preset exhaustive
-```
-
 ## Presets
 
-| Preset       | Configs | Estimación |
-|--------------|---------|------------|
-| `canonical`  | 4       | ~1,5 h     |
-| `likely`     | 12      | ~5 h       |
-| `exhaustive` | 27      | ~10–15 h *(default)* |
+| Preset       | Configs | Estimación @ 10 GH/s | Estimación @ 1.2 GH/s (medido) |
+|--------------|---------|----------------------|--------------------------------|
+| `canonical`  | 4       | ~1,5 h               | ~13 h                          |
+| `likely`     | 12      | ~5 h                  | ~42 h                          |
+| `exhaustive` | 42      | ~15 h *(default)*     | ~5 días                        |
 
-(Estimaciones a 10 GH/s sostenidos en RTX 5070 Ti; recalibrar tras Fase 6.)
+Las estimaciones a 10 GH/s son las de la spec. La columna real refleja la
+medición actual de Fase 3 (~1.2 GH/s); Fase 6 cierra el gap.
 
 ## Roadmap
 
 - [x] Fase 0 — esqueleto + loader + `inspect`
 - [x] Fase 1 — generador combinatorio CPU (crítico)
 - [x] Fase 2 — KDFs + descifrado CPU + plan + estado atómico + CLI ampliada
-- [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/256, brute para 9 KDFs)
-- [ ] Fase 4 — multi-config runner + persistencia + reanudación + tests de pausa
+- [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/192/256, brute parametrizado)
+- [x] Fase 4 — runner + checkpointing + reanudación + signal handling
 - [ ] Fase 5 — TUI en vivo
 - [ ] Fase 6 — optimización (warp-cooperative AES, MD5 vectorizado)
 

@@ -10,4 +10,6 @@ pub mod cuda;
 pub mod kdf;
 pub mod plan;
 pub mod reference;
+pub mod runner;
+pub mod signal;
 pub mod state;

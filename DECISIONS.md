@@ -357,3 +357,83 @@ hits emitidos (`DeviceHit::kdf_id`).
 
 Esto garantiza que sesiones interrumpidas en Fase 3 puedan reanudarse
 con el binario de Fase 3.5 sin reordenar progreso ya guardado.
+
+---
+
+## D-015 — SIGINT/SIGTERM con flag + conditional_shutdown
+
+**Contexto** (spec §7.5): primer SIGINT/SIGTERM debe terminar el batch
+en curso, persistir progreso y salir limpio. Segundo SIGINT durante el
+shutdown debe ser aborto inmediato (~código 130).
+
+**Implementación** (`src/signal.rs`): `signal-hook 0.3` con DOS
+handlers por señal, registrados en este orden:
+
+1. `flag::register_conditional_shutdown(SIG, exit_code, &flag)`
+2. `flag::register(SIG, &flag)`
+
+Los handlers corren en orden de registro:
+
+- **Primera entrega**: `conditional_shutdown` ve `flag=false` →
+  no-op. `register` pone `flag=true`. El runner consulta el flag al
+  final del batch, persiste y sale.
+- **Segunda entrega**: `conditional_shutdown` ve `flag=true` → mata
+  el proceso con el exit code dado. (El segundo handler ni llega a
+  ejecutarse.)
+
+**Atómicas**: SIGKILL es incontrolable; la atomicidad de
+`state::atomic_write` (write-tmp → fsync → rename) es la salvaguarda
+final. En el peor caso se pierde un único batch (§7.2).
+
+**Test bloqueante**: `tests/resume.rs::test_resume_finds_key_after_pause`
+spawnea el binario, manda SIGINT a los 1.5 s, espera salida limpia y
+luego reanuda. Validado en hardware (run 1 paró en idx 700M tras 1.32 s,
+resume llegó al hit en idx 1.7G tras 1.82 s adicionales).
+
+---
+
+## D-016 — Salida temprana en primer hit confirmado
+
+**Contexto**: una vez encontrada la clave, seguir barriendo sería
+gasto puro de GPU. La probabilidad de un segundo hit confirmado bajo
+otra (KDF, IV) en el mismo barrido es ~2⁻¹³⁰ × N — efectivamente
+cero.
+
+**Decisión**: el runner devuelve `RunOutcome::Found` y termina en
+cuanto valida el primer hit con verdict `Confirmed`. El hit se guarda
+en `progress.toml` (con password, config, plaintext hex y timestamp)
+antes de salir.
+
+**Reanudación tras hit**: si el usuario pasa `--resume`, el runner
+volverá a ejecutar desde donde quedó `next_step`; al ver el hit
+guardado, el flag `Found` no se re-emite automáticamente (el runner
+trabaja independiente del histórico de hits). Si quiere "verificar
+otras KDFs" puede usar `--skip-config` para saltarse la KDF que ya
+encontró la clave.
+
+**Tests cubren**: `tests/e2e_synthetic.rs::test_e2e_synthetic_aes128_cbc`
+(salida temprana en hit) y `tests/resume.rs::test_resume_finds_key_after_pause`
+(hit + persist + exit code 0).
+
+---
+
+## D-017 — Validación PKCS7 del último bloque sobre 1600 B reales
+
+**Contexto**: Fase 3 validaba hits con `validate_hit` sobre el CT
+sintético de los tests (1600 B con PKCS7 manufacturado). En Fase 4 el
+runner aplica la misma función al CT REAL del fichero objetivo.
+
+**Decisión**: `runner::run` invoca `reference::validate_hit(key, iv,
+ct.ct())` donde `ct.ct()` son los 1600 B del ciphertext del fichero
+(tras decodificar base64). Sobre esos 1600 B:
+
+1. `decrypt_cbc_raw` → 1600 B de plaintext.
+2. comparar primeros 32 B con `KNOWN_PREFIX_32`.
+3. validar PKCS7 sobre los últimos 16 B (último byte ∈ [1,16] +
+   los últimos N bytes idénticos a N).
+
+Si pasan los tres → `Confirmed`. Si falla (3) tras pasar (1)+(2) →
+`Pkcs7Mismatch` ⇒ **abortar el barrido** con warning (D-007).
+
+El runner persiste el plaintext completo en hex en `Hit::plaintext_hex`
+antes de salir, para auditoría.
