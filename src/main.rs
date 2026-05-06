@@ -1,16 +1,23 @@
+//! `quattro-crack` — CLI tras D-029.
+//!
+//! El barrido tiene una **única configuración** (`md5hex_full /
+//! aes-256-ecb / pkcs7`), así que los flags `--preset`, `--kdf`, `--iv`,
+//! `--skip-config` y `--only-config` se eliminan.
+
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use tracing_appender::non_blocking::WorkerGuard;
 
-use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, CT_LEN, IV_LEN, TOTAL_BIN_LEN};
+use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, TOTAL_BIN_LEN};
 use quattro_crack::combinatorics::N as N_TOTAL;
+use quattro_crack::cuda::{CudaCtx, KernelBundle};
 use quattro_crack::gpu_metrics::GpuMonitor;
-use quattro_crack::plan::{default_plan_order, Plan, Preset};
+use quattro_crack::plan::{Plan, PLAN_FORMAT_VERSION, SINGLE_PLAN_DESCRIPTION};
 use quattro_crack::runner::{self, ProgressSink, RunOptions, RunOutcome, StderrSink};
 use quattro_crack::state::{load_plan, load_progress};
 use quattro_crack::tui::{TuiSink, TuiSinkConfig};
@@ -19,7 +26,7 @@ use quattro_crack::tui::{TuiSink, TuiSinkConfig};
 #[command(
     name = "quattro-crack",
     version,
-    about = "Brute-force CUDA contra AES-CBC + MD5 con estructura de password conocida"
+    about = "Brute-force CUDA contra AES-256-ECB + md5hex_full (D-029)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,17 +42,14 @@ enum Cmd {
         path: PathBuf,
     },
 
-    /// Imprime el plan de barrido resuelto para el preset elegido.
+    /// Imprime el plan único de barrido (D-029).
     Plan {
-        #[arg(long, value_enum, default_value_t = PresetCli::Exhaustive)]
-        preset: PresetCli,
-
         /// Ruta al fichero objetivo (para incluir su SHA-256 en el plan).
         #[arg(long, default_value = "./data/cifrado.txt")]
         input: PathBuf,
 
-        /// Tamaño de batch del kernel (Fase 3). Default = 16 Mi.
-        #[arg(long, default_value_t = 16_777_216)]
+        /// Tamaño de batch del kernel.
+        #[arg(long, default_value_t = 67_108_864)]
         batch_size: u32,
 
         /// Si se pasa, escribe `plan.toml` en `state/`.
@@ -59,8 +63,8 @@ enum Cmd {
         state_dir: PathBuf,
     },
 
-    /// Ejecuta el barrido. Persistencia atómica al final de cada batch;
-    /// SIGINT/SIGTERM termina el batch en curso, guarda el estado y sale.
+    /// Ejecuta el barrido único. SIGINT/SIGTERM termina el batch en
+    /// curso, guarda el estado y sale. Ver D-025/D-026/D-029.
     Run {
         /// Ruta al fichero base64 con el ciphertext.
         #[arg(long, default_value = "./data/cifrado.txt")]
@@ -70,64 +74,53 @@ enum Cmd {
         #[arg(long, default_value = "./state")]
         state_dir: PathBuf,
 
-        /// Preset del plan (ignorado si --resume).
-        #[arg(long, value_enum, default_value_t = PresetCli::Exhaustive)]
-        preset: PresetCli,
-
-        /// Tamaño de batch del kernel.
-        #[arg(long, default_value_t = 16_777_216)]
+        /// Tamaño de batch del kernel. Default 64 Mi (D-025).
+        #[arg(long, default_value_t = 67_108_864)]
         batch_size: u32,
+
+        /// Cada cuántos batches se persiste `progress.toml` con `fsync`
+        /// (D-026). Default 8.
+        #[arg(long, default_value_t = 8)]
+        flush_every: u32,
 
         /// Reanuda una sesión previa. Verifica SHA-256 del input.
         #[arg(long)]
         resume: bool,
 
-        /// Ignora el chequeo de major version al reanudar (úsalo si sabes lo que haces).
+        /// Ignora el chequeo de major version al reanudar.
         #[arg(long)]
         force_resume: bool,
 
-        /// Marca como completada la config con este display_id (multi).
-        #[arg(long, value_name = "ID")]
-        skip_config: Vec<String>,
-
-        /// Restringe el barrido a este display_id (multi). Marca el resto como completas.
-        #[arg(long, value_name = "ID")]
-        only_config: Vec<String>,
-
-        /// Fuerza salida tipo Fase 4 a stderr aunque haya TTY (útil para CI/scripts).
+        /// Fuerza salida tipo Fase 4 a stderr aunque haya TTY.
         #[arg(long)]
         no_tui: bool,
 
-        /// Directorio donde se escriben los logs (`run-YYYYMMDD-HHMMSS.log`).
+        /// Directorio donde se escriben los logs.
         #[arg(long, default_value = "./logs")]
         log_dir: PathBuf,
     },
 
-    /// Borra `state/plan.toml`, `state/progress.toml` y sus `.bak`. Pide
-    /// confirmación interactiva salvo `--yes`.
+    /// Borra `state/plan.toml`, `state/progress.toml` y sus `.bak`.
     Reset {
         #[arg(long, default_value = "./state")]
         state_dir: PathBuf,
         #[arg(long)]
         yes: bool,
     },
-}
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum PresetCli {
-    Canonical,
-    Likely,
-    Exhaustive,
-}
+    /// Mide throughput sostenido del kernel único (D-029) sobre un
+    /// ct_block_0 que no genera hits.
+    ///
+    /// Códigos de salida: 0 si ≥ 3 GH/s, 1 si 2 ≤ x < 3, 2 si < 2.
+    Benchmark {
+        /// Duración total objetivo de la medición (segundos).
+        #[arg(long, default_value_t = 30)]
+        duration: u64,
 
-impl From<PresetCli> for Preset {
-    fn from(p: PresetCli) -> Self {
-        match p {
-            PresetCli::Canonical => Preset::Canonical,
-            PresetCli::Likely => Preset::Likely,
-            PresetCli::Exhaustive => Preset::Exhaustive,
-        }
-    }
+        /// Tamaño de cada batch lanzado al kernel.
+        #[arg(long, default_value_t = 128 * 1024 * 1024)]
+        batch_size: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -135,21 +128,18 @@ fn main() -> Result<()> {
     match cli.command {
         Cmd::Inspect { path } => inspect(&path),
         Cmd::Plan {
-            preset,
             input,
             batch_size,
             save,
-        } => plan_cmd(preset.into(), &input, batch_size, save),
+        } => plan_cmd(&input, batch_size, save),
         Cmd::Status { state_dir } => status_cmd(&state_dir),
         Cmd::Run {
             input,
             state_dir,
-            preset,
             batch_size,
+            flush_every,
             resume,
             force_resume,
-            skip_config,
-            only_config,
             no_tui,
             log_dir,
         } => run_cmd(
@@ -157,16 +147,15 @@ fn main() -> Result<()> {
                 input_path: input,
                 state_dir,
                 batch_size,
-                preset: preset.into(),
                 resume,
                 force_resume,
-                skip_configs: skip_config,
-                only_configs: only_config,
+                flush_every_n_batches: flush_every,
             },
             no_tui,
             &log_dir,
         ),
         Cmd::Reset { state_dir, yes } => reset_cmd(&state_dir, yes),
+        Cmd::Benchmark { duration, batch_size } => benchmark_cmd(duration, batch_size),
     }
 }
 
@@ -175,45 +164,31 @@ fn inspect(path: &Path) -> Result<()> {
 
     println!("file:         {}", ct.source_path.display());
     println!(
-        "size:         {} B  ({} IV + {} CT = {} bloques AES de 16 B)",
-        TOTAL_BIN_LEN, IV_LEN, CT_LEN, CT_BLOCKS
+        "size:         {} B  ({} bloques AES-256-ECB de 16 B, sin IV)",
+        TOTAL_BIN_LEN, CT_BLOCKS
     );
-    println!("iv:           {}", hex::encode(ct.iv()));
     println!("ct[0..32]:    {}", hex::encode(&ct.ct()[..32]));
     println!("sha256(file): {}", hex::encode(ct.source_sha256));
     Ok(())
 }
 
-fn plan_cmd(preset: Preset, input: &Path, batch_size: u32, save: bool) -> Result<()> {
+fn plan_cmd(input: &Path, batch_size: u32, save: bool) -> Result<()> {
     let ct = Ciphertext::load(input).with_context(|| format!("cargando {}", input.display()))?;
     let sha_hex = hex::encode(ct.source_sha256);
 
-    let plan = Plan::from_preset(
-        env!("CARGO_PKG_VERSION"),
+    let plan = Plan::new_single(
+        PLAN_FORMAT_VERSION,
         ct.source_path.display().to_string(),
         sha_hex.clone(),
-        preset,
         batch_size,
-    )
-    .context("construyendo plan")?;
+    );
 
-    println!("plan         preset: {}", preset.as_str());
+    println!("plan         única configuración (D-029)");
+    println!("config       {SINGLE_PLAN_DESCRIPTION}");
     println!("source       {}", plan.source_path);
     println!("sha256       {}", plan.source_sha256);
     println!("batch_size   {}", plan.batch_size);
-    println!("entries      {}", plan.entries.len());
-    println!();
-    println!("{:>3}  kdf            mode  iv         klen", "#");
-    for (i, c) in plan.entries.iter().enumerate() {
-        println!(
-            "{:>3}. {:<14} {:<5} {:<10} {} B",
-            i + 1,
-            c.kdf.as_str(),
-            c.mode.as_str(),
-            c.iv.as_str(),
-            c.key_len_bytes(),
-        );
-    }
+    println!("N            {} candidatas", N_TOTAL);
 
     if save {
         let path = PathBuf::from("./state/plan.toml");
@@ -221,19 +196,6 @@ fn plan_cmd(preset: Preset, input: &Path, batch_size: u32, save: bool) -> Result
             .with_context(|| format!("guardando {}", path.display()))?;
         println!();
         println!("plan guardado en {}", path.display());
-    } else {
-        // Default order completo en background (incluyendo entries fuera del preset)
-        // para que el usuario pueda comprobar que el orden es el documentado.
-        let full = default_plan_order();
-        if plan.entries.len() < full.len() {
-            println!();
-            println!(
-                "(preset reduce a {} de {} configuraciones; pasa --preset exhaustive \
-                 para ver el plan completo, o --save para escribir state/plan.toml)",
-                plan.entries.len(),
-                full.len()
-            );
-        }
     }
     Ok(())
 }
@@ -244,44 +206,32 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
 
     if !plan_path.exists() {
         println!("no hay plan guardado en {}.", plan_path.display());
-        println!("lanza `quattro-crack plan --preset <…> --save` para crearlo,");
-        println!("o `quattro-crack run --resume` cuando exista runner (Fase 4).");
+        println!("lanza `quattro-crack plan --save` para crearlo,");
+        println!("o `quattro-crack run` para arrancar el barrido.");
         return Ok(());
     }
 
     let plan = load_plan(&plan_path)
         .with_context(|| format!("leyendo {}", plan_path.display()))?;
     println!("plan         {} (v{})", plan_path.display(), plan.program_version);
+    println!("config       {SINGLE_PLAN_DESCRIPTION}");
     println!("source       {}", plan.source_path);
     println!("sha256       {}", plan.source_sha256);
-    println!("preset       {:?}", plan.preset);
-    println!("entries      {}", plan.entries.len());
+    println!("batch_size   {}", plan.batch_size);
     println!();
 
     if let Ok(progress) = load_progress(&prog_path) {
         println!("progress     {}", prog_path.display());
+        let pct = 100.0 * (progress.next_step as f64) / (N_TOTAL as f64);
         println!(
-            "current      cfg #{} of {}",
-            progress.current_config + 1,
-            plan.entries.len()
+            "next_step    {} ({:.4}% del espacio)",
+            progress.next_step, pct
         );
+        println!("tried        {}", progress.tried);
         println!("hits         {}", progress.hits.len());
         println!("last_flush   {}", progress.last_flush_utc);
-        for (i, p) in progress.per_config.iter().enumerate() {
-            if i >= plan.entries.len() {
-                break;
-            }
-            let e = &plan.entries[i];
-            println!(
-                "  cfg {:>2} {:<28} next_step={:>15}  tried={}",
-                i + 1,
-                e.display_id(),
-                p.next_step,
-                p.tried
-            );
-        }
     } else {
-        println!("(sin progreso persistido todavía — ejecuta el runner para iniciar)");
+        println!("(sin progreso persistido todavía — ejecuta `run` para iniciar)");
     }
     Ok(())
 }
@@ -303,7 +253,6 @@ fn run_cmd(opts: RunOptions, no_tui: bool, log_dir: &Path) -> Result<()> {
         Arc::new(StderrSink::new())
     };
 
-    // GPU monitor (NVML) — sólo si la TUI está activa; con stderr es ruido.
     let _gpu_monitor = if use_tui {
         Some(GpuMonitor::start(Arc::clone(&sink)))
     } else {
@@ -311,25 +260,28 @@ fn run_cmd(opts: RunOptions, no_tui: bool, log_dir: &Path) -> Result<()> {
     };
 
     let outcome = runner::run(opts, sink.as_ref(), stop)?;
-    // Drop del sink ⇒ join del renderer / monitor antes de imprimir el resumen
-    // a stdout. Lo soltamos aquí explícito para garantizar el orden.
     drop(_gpu_monitor);
     drop(sink);
 
     match outcome {
         RunOutcome::Found { hit, elapsed_secs } => {
-            println!("HIT  pw='{}' idx={} cfg={} elapsed={:.2}s",
-                hit.password, hit.idx, hit.config.display_id(), elapsed_secs);
+            println!(
+                "HIT  pw='{}' idx={} elapsed={:.2}s",
+                hit.password, hit.idx, elapsed_secs
+            );
             Ok(())
         }
         RunOutcome::Completed { elapsed_secs } => {
             println!("DONE  plan completado SIN hit ({:.2}s)", elapsed_secs);
             Ok(())
         }
-        RunOutcome::Paused { elapsed_secs, last_config, last_step } => {
+        RunOutcome::Paused {
+            elapsed_secs,
+            last_step,
+        } => {
             println!(
-                "PAUSED elapsed={:.2}s  last_config={}  last_step={}",
-                elapsed_secs, last_config, last_step
+                "PAUSED elapsed={:.2}s  last_step={}",
+                elapsed_secs, last_step
             );
             Ok(())
         }
@@ -405,3 +357,84 @@ fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn benchmark_cmd(duration_secs: u64, batch_size: u64) -> Result<()> {
+    let ctx = CudaCtx::init().context("CUDA init")?;
+    let device = ctx.device_name().unwrap_or_else(|_| "<unknown>".into());
+    let mut bundle = KernelBundle::load(&ctx).context("cargando kernel")?;
+
+    // CT block aleatorio improbable de matchear "Leonardo da Vinc".
+    let ct_block_0 = [0xffu8; 16];
+
+    println!("device       : {device}");
+    println!("config       : {SINGLE_PLAN_DESCRIPTION}");
+    println!("batch size   : {batch_size} ({:.2} Mi)", batch_size as f64 / (1u64 << 20) as f64);
+    println!("duration tgt : {duration_secs}s");
+    println!();
+
+    let _ = bundle
+        .launch(0, batch_size.min(16 * 1024 * 1024), &ct_block_0)
+        .context("warmup launch")?;
+
+    let total_target = std::time::Duration::from_secs(duration_secs);
+    let mut total_candidates: u64 = 0;
+    let mut total_elapsed = std::time::Duration::ZERO;
+    let mut peak_ghs: f64 = 0.0;
+    let mut runs: Vec<f64> = Vec::new();
+
+    let started = std::time::Instant::now();
+    let mut idx_base: u64 = 0;
+    while started.elapsed() < total_target {
+        let t0 = std::time::Instant::now();
+        let _ = bundle
+            .launch(idx_base, batch_size, &ct_block_0)
+            .context("benchmark launch")?;
+        let dt = t0.elapsed();
+        let ghs = batch_size as f64 / dt.as_secs_f64() / 1.0e9;
+        runs.push(ghs);
+        if ghs > peak_ghs {
+            peak_ghs = ghs;
+        }
+        total_candidates += batch_size;
+        total_elapsed += dt;
+        idx_base = idx_base.wrapping_add(batch_size);
+        eprintln!(
+            "  batch #{:>3}: {:>8.3} GH/s ({:>5} ms, idx_base={})",
+            runs.len(),
+            ghs,
+            dt.as_millis(),
+            idx_base.wrapping_sub(batch_size)
+        );
+    }
+
+    let avg_ghs = total_candidates as f64 / total_elapsed.as_secs_f64() / 1.0e9;
+    let mut sorted = runs.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.is_empty() {
+        0.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    println!();
+    println!("--- result ---");
+    println!("batches      : {}", runs.len());
+    println!("total cand   : {total_candidates}");
+    println!("total time   : {:.3}s", total_elapsed.as_secs_f64());
+    println!("peak GH/s    : {peak_ghs:.3}");
+    println!("avg  GH/s    : {avg_ghs:.3}");
+    println!("median GH/s  : {median:.3}");
+
+    let target = 3.0;
+    let warn = 2.0;
+    let exit_code: i32 = if avg_ghs >= target {
+        println!("STATUS       : OK (≥ {target:.1} GH/s)");
+        0
+    } else if avg_ghs >= warn {
+        println!("STATUS       : WARNING ({avg_ghs:.3} GH/s entre {warn:.1} y {target:.1})");
+        1
+    } else {
+        println!("STATUS       : REGRESSION ({avg_ghs:.3} GH/s < {warn:.1} GH/s)");
+        2
+    };
+    std::process::exit(exit_code);
+}

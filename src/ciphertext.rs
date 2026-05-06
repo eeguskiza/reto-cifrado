@@ -1,7 +1,11 @@
 //! Carga y validación del fichero objetivo (`cifrado.txt`).
 //!
-//! Formato: una línea base64 que tras decodificar produce **1616 bytes**
-//! binarios = 16 B IV + 1600 B ciphertext (100 bloques AES de 16 B).
+//! Formato (post-D-029, AES-256-ECB confirmado oficialmente):
+//! una línea base64 que tras decodificar produce **1616 bytes** binarios,
+//! que son **todos ciphertext** (101 bloques AES de 16 B). En ECB no hay
+//! IV — el mismo fichero binario que en Fase 4–6 se interpretaba como
+//! `16 IV + 1600 CT` se reinterpreta ahora como `1616 CT` puros.
+//!
 //! Tolerante a padding ausente y a salto de línea final.
 
 use std::fs;
@@ -14,12 +18,8 @@ use thiserror::Error;
 
 /// Tamaño exacto del binario tras decodificar base64.
 pub const TOTAL_BIN_LEN: usize = 1616;
-/// Tamaño del IV (también tamaño de bloque AES-128).
-pub const IV_LEN: usize = 16;
-/// Tamaño del ciphertext.
-pub const CT_LEN: usize = TOTAL_BIN_LEN - IV_LEN;
-/// Bloques AES en el ciphertext.
-pub const CT_BLOCKS: usize = CT_LEN / 16;
+/// Bloques AES en el ciphertext (1616 / 16).
+pub const CT_BLOCKS: usize = TOTAL_BIN_LEN / 16;
 
 /// Errores de carga del ciphertext.
 #[derive(Debug, Error)]
@@ -35,19 +35,15 @@ pub enum CiphertextError {
     Base64(#[from] base64::DecodeError),
 
     #[error(
-        "tamaño binario inesperado: {actual} bytes (se esperaban {expected}, \
-         = {iv_len} IV + {ct_len} CT)"
+        "tamaño binario inesperado: {actual} bytes (se esperaban {expected} = {blocks} bloques AES de 16 B)"
     )]
     WrongSize {
         actual: usize,
         expected: usize,
-        iv_len: usize,
-        ct_len: usize,
+        blocks: usize,
     },
 
-    #[error(
-        "el ciphertext debe ser múltiplo de 16 (bloque AES); tiene {0} bytes"
-    )]
+    #[error("el ciphertext debe ser múltiplo de 16 (bloque AES); tiene {0} bytes")]
     NotBlockAligned(usize),
 }
 
@@ -56,13 +52,14 @@ pub enum CiphertextError {
 pub struct Ciphertext {
     /// SHA-256 de los bytes **del fichero original** (no del binario decodificado).
     /// Esto es lo que persistimos en `plan.toml` para detectar si el usuario
-    /// ha cambiado el fichero entre sesiones (§7.4).
+    /// ha cambiado el fichero entre sesiones.
     pub source_sha256: [u8; 32],
 
     /// Path original, útil para mensajes de error y persistencia.
     pub source_path: PathBuf,
 
-    /// Bytes binarios completos, 1616 B = `iv ‖ ct`.
+    /// Bytes binarios completos, 1616 B = 101 bloques de ciphertext puro
+    /// (ECB no tiene IV).
     pub raw: Vec<u8>,
 }
 
@@ -82,12 +79,11 @@ impl Ciphertext {
             return Err(CiphertextError::WrongSize {
                 actual: raw.len(),
                 expected: TOTAL_BIN_LEN,
-                iv_len: IV_LEN,
-                ct_len: CT_LEN,
+                blocks: CT_BLOCKS,
             });
         }
-        if (raw.len() - IV_LEN) % 16 != 0 {
-            return Err(CiphertextError::NotBlockAligned(raw.len() - IV_LEN));
+        if raw.len() % 16 != 0 {
+            return Err(CiphertextError::NotBlockAligned(raw.len()));
         }
 
         Ok(Self {
@@ -97,22 +93,15 @@ impl Ciphertext {
         })
     }
 
-    /// IV (primeros 16 bytes).
-    pub fn iv(&self) -> &[u8; IV_LEN] {
-        // raw.len() == TOTAL_BIN_LEN garantizado en `load`.
-        self.raw[..IV_LEN].try_into().expect("iv slice size")
-    }
-
-    /// Ciphertext (los 1600 bytes restantes).
+    /// Ciphertext completo (1616 B). En ECB todo es ciphertext.
     pub fn ct(&self) -> &[u8] {
-        &self.raw[IV_LEN..]
+        &self.raw
     }
 
-    /// Primer bloque del ciphertext (16 B), el que valida el kernel.
+    /// Primer bloque del ciphertext (16 B), el que valida el kernel
+    /// contra `"Leonardo da Vinc"` tras descifrar.
     pub fn ct_first_block(&self) -> &[u8; 16] {
-        self.raw[IV_LEN..IV_LEN + 16]
-            .try_into()
-            .expect("first ct block size")
+        self.raw[..16].try_into().expect("first ct block size")
     }
 }
 
@@ -121,15 +110,12 @@ impl Ciphertext {
 /// - espacios en blanco
 /// - padding ausente o presente
 fn decode_base64_padding_tolerant(input: &[u8]) -> Result<Vec<u8>, base64::DecodeError> {
-    // Quita whitespace.
     let mut clean = Vec::with_capacity(input.len());
     for &b in input {
         if b != b'\n' && b != b'\r' && b != b' ' && b != b'\t' {
             clean.push(b);
         }
     }
-    // Quita padding existente para usar el engine NO_PAD, que tolera
-    // longitudes no múltiplo de 4.
     while clean.last() == Some(&b'=') {
         clean.pop();
     }
@@ -146,9 +132,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
-    /// Tres bloques AES sintéticos, base64 con padding y newline final.
     fn synthetic_with_padding() -> Vec<u8> {
-        // 1616 bytes = 1010 hex digits * 1.6... no, manually:
         let mut binary = vec![0u8; TOTAL_BIN_LEN];
         for (i, b) in binary.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
@@ -180,8 +164,8 @@ mod tests {
         let p = write_tmp("padded.txt", &synthetic_with_padding());
         let ct = Ciphertext::load(&p).unwrap();
         assert_eq!(ct.raw.len(), TOTAL_BIN_LEN);
-        assert_eq!(ct.iv()[0], 0);
-        assert_eq!(ct.iv()[15], 15);
+        assert_eq!(ct.ct_first_block()[0], 0);
+        assert_eq!(ct.ct_first_block()[15], 15);
     }
 
     #[test]
@@ -193,7 +177,6 @@ mod tests {
 
     #[test]
     fn rejects_wrong_size() {
-        // 1610 bytes binarios (un bloque corto) → tras base64 no será 1616.
         let mut bin = vec![0u8; 1610];
         for (i, b) in bin.iter_mut().enumerate() {
             *b = (i & 0xff) as u8;
@@ -208,22 +191,18 @@ mod tests {
     }
 
     #[test]
-    fn iv_and_ct_split_correctly() {
+    fn ct_returns_full_1616_bytes() {
         let p = write_tmp("split.txt", &synthetic_with_padding());
         let ct = Ciphertext::load(&p).unwrap();
-        assert_eq!(ct.iv().len(), IV_LEN);
-        assert_eq!(ct.ct().len(), CT_LEN);
+        assert_eq!(ct.ct().len(), TOTAL_BIN_LEN);
         assert_eq!(ct.ct().len() % 16, 0);
         assert_eq!(ct.ct().len() / 16, CT_BLOCKS);
-        // El primer bloque CT debe arrancar en byte 16 del binario.
-        assert_eq!(ct.ct_first_block()[0], 16);
+        // Primer bloque CT empieza en byte 0 (no en byte 16 como en CBC).
+        assert_eq!(ct.ct_first_block()[0], 0);
     }
 
     #[test]
     fn sha256_is_over_source_file_bytes_not_decoded() {
-        // SHA-256 cubre el fichero original (incluido el newline final si existe).
-        // Verificamos que dos ficheros con el mismo binario decodificado pero
-        // distinto whitespace dan distinto sha256, y que el binario es el mismo.
         let with_nl = synthetic_with_padding();
         let mut without_nl = with_nl.clone();
         if without_nl.last() == Some(&b'\n') {

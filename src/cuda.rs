@@ -1,12 +1,9 @@
 //! Bindings runtime CUDA con `cudarc 0.19`.
 //!
-//! Responsabilidades de este módulo:
-//!
-//! - Inicializar el contexto CUDA y seleccionar la GPU 0.
-//! - Cargar los PTX precompilados por `build.rs` (1 por KDF, más
-//!   `dump_passwords` para tests de paridad).
-//! - Ofrecer `KernelBundle::launch` que ejecuta el barrido de un rango
-//!   de índices y devuelve los hits encontrados.
+//! Tras D-029, el barrido tiene un único kernel
+//! (`brute_md5hex_aes256_ecb.cu`). Eliminamos el array `PTX_BRUTE` por
+//! KDF y simplificamos `KernelBundle::load()` para no recibir parámetros.
+//! `launch` ya no recibe IV (ECB no lo usa).
 //!
 //! **Anti-pattern recordado**: la generación de candidatas vive en el
 //! kernel; host solo pasa `idx_base` + `idx_count`. Cero passwords por
@@ -22,19 +19,16 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::config::{IvSource, Kdf};
-
-/// Tamaño del buffer de hits por batch. >256 entries con margen para que
-/// el test "100 hits simultáneos" no sature jamás (D-006 / spec §3.4-§7).
+/// Tamaño del buffer de hits por batch. >256 entries con margen para
+/// que el test "100 hits simultáneos" no sature jamás.
 pub const HITS_CAPACITY: u32 = 1024;
 
 /// Hit emitido por el kernel — coincide bit a bit con el struct C++.
+/// Tras D-029 solo lleva `idx`: kdf/iv son implícitos (única config).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct DeviceHit {
     pub idx: u64,
-    pub kdf_id: u32,
-    pub iv_id: u32,
 }
 
 /// Contexto CUDA + stream por defecto. Inicialízalo una vez por proceso.
@@ -44,7 +38,6 @@ pub struct CudaCtx {
 }
 
 impl CudaCtx {
-    /// Inicializa CUDA, selecciona la GPU 0 y crea el stream por defecto.
     pub fn init() -> Result<Self> {
         let ctx = CudaContext::new(0).context("CudaContext::new(0): ¿hay una NVIDIA visible?")?;
         let stream = ctx.default_stream();
@@ -64,15 +57,10 @@ impl CudaCtx {
     }
 }
 
-// ----- Kernel auxiliar de paridad -----
+// ----- Kernel auxiliar de paridad del generador -----
 
-/// PTX precompilado por build.rs para el kernel auxiliar `dump_passwords`.
-/// Embebido como string al binario; cudarc lo carga por puntero.
-const PTX_DUMP_PASSWORDS: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/dump_passwords.ptx"));
+const PTX_DUMP_PASSWORDS: &str = include_str!(concat!(env!("OUT_DIR"), "/dump_passwords.ptx"));
 
-/// Vuelca, para cada `idx ∈ [base, base+count)`, los 14 bytes del password
-/// generado in-device. Útil **solo** para el test de paridad CPU↔GPU.
 pub fn gpu_dump_passwords(ctx: &CudaCtx, idx_base: u64, idx_count: u64) -> Result<Vec<u8>> {
     let stream = ctx.stream().clone();
     let module: Arc<CudaModule> = ctx
@@ -98,19 +86,13 @@ pub fn gpu_dump_passwords(ctx: &CudaCtx, idx_base: u64, idx_count: u64) -> Resul
     unsafe { launch.launch(cfg) }?;
 
     stream.synchronize()?;
-    let host = stream.clone_dtoh(&out_dev)?;
-    Ok(host)
+    Ok(stream.clone_dtoh(&out_dev)?)
 }
 
-// ----- Helpers de test para las primitivas (MD5, AES) -----
+// ----- Helpers de test para MD5 / AES (FIPS-197 + RFC 1321) -----
 
-/// PTX del kernel de test de MD5 device.
 const PTX_MD5_TEST: &str = include_str!(concat!(env!("OUT_DIR"), "/md5_test.ptx"));
 
-/// Calcula MD5 device para un batch de inputs y devuelve `n_inputs * 16` bytes.
-///
-/// `data` es el buffer empaquetado: cada slot ocupa `stride` bytes; los
-/// primeros `lens[i]` bytes del slot `i` son el input válido.
 pub fn gpu_md5_batch(
     ctx: &CudaCtx,
     data: &[u8],
@@ -148,7 +130,6 @@ pub fn gpu_md5_batch(
     Ok(stream.clone_dtoh(&out_dev)?)
 }
 
-/// `MD5(MD5(in))` para un batch de digests de 16 B.
 pub fn gpu_md5_md5_batch(ctx: &CudaCtx, digests: &[u8]) -> Result<Vec<u8>> {
     assert_eq!(digests.len() % 16, 0);
     let n = (digests.len() / 16) as u32;
@@ -178,26 +159,19 @@ pub fn gpu_md5_md5_batch(ctx: &CudaCtx, digests: &[u8]) -> Result<Vec<u8>> {
     Ok(stream.clone_dtoh(&dev_out)?)
 }
 
-// ----- Helpers de test para AES device -----
-
-/// PTX del kernel de test de AES device.
 const PTX_AES_TEST: &str = include_str!(concat!(env!("OUT_DIR"), "/aes_test.ptx"));
 
-/// AES-128 decrypt sobre un batch. `keys` = n*16 B, `cts` = n*16 B.
 pub fn gpu_aes128_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<u8>> {
     assert_eq!(keys.len() % 16, 0);
     assert_eq!(cts.len() % 16, 0);
     let n = (keys.len() / 16) as u32;
     assert_eq!(n as usize * 16, cts.len());
-
     let stream = ctx.stream().clone();
     let module = ctx.raw_ctx().load_module(Ptx::from_src(PTX_AES_TEST))?;
     let func = module.load_function("aes128_decrypt_test")?;
-
     let dev_keys = stream.clone_htod(keys)?;
     let dev_cts = stream.clone_htod(cts)?;
     let mut dev_pts: CudaSlice<u8> = stream.alloc_zeros::<u8>(n as usize * 16)?;
-
     let block_dim: u32 = 64;
     let grid_dim: u32 = n.div_ceil(block_dim);
     let cfg = LaunchConfig {
@@ -215,21 +189,17 @@ pub fn gpu_aes128_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<
     Ok(stream.clone_dtoh(&dev_pts)?)
 }
 
-/// AES-192 decrypt sobre un batch. `keys` = n*24 B, `cts` = n*16 B.
 pub fn gpu_aes192_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<u8>> {
     assert_eq!(keys.len() % 24, 0);
     assert_eq!(cts.len() % 16, 0);
     let n = (keys.len() / 24) as u32;
     assert_eq!(n as usize * 16, cts.len());
-
     let stream = ctx.stream().clone();
     let module = ctx.raw_ctx().load_module(Ptx::from_src(PTX_AES_TEST))?;
     let func = module.load_function("aes192_decrypt_test")?;
-
     let dev_keys = stream.clone_htod(keys)?;
     let dev_cts = stream.clone_htod(cts)?;
     let mut dev_pts: CudaSlice<u8> = stream.alloc_zeros::<u8>(n as usize * 16)?;
-
     let block_dim: u32 = 64;
     let grid_dim: u32 = n.div_ceil(block_dim);
     let cfg = LaunchConfig {
@@ -247,21 +217,17 @@ pub fn gpu_aes192_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<
     Ok(stream.clone_dtoh(&dev_pts)?)
 }
 
-/// AES-256 decrypt sobre un batch. `keys` = n*32 B, `cts` = n*16 B.
 pub fn gpu_aes256_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<u8>> {
     assert_eq!(keys.len() % 32, 0);
     assert_eq!(cts.len() % 16, 0);
     let n = (keys.len() / 32) as u32;
     assert_eq!(n as usize * 16, cts.len());
-
     let stream = ctx.stream().clone();
     let module = ctx.raw_ctx().load_module(Ptx::from_src(PTX_AES_TEST))?;
     let func = module.load_function("aes256_decrypt_test")?;
-
     let dev_keys = stream.clone_htod(keys)?;
     let dev_cts = stream.clone_htod(cts)?;
     let mut dev_pts: CudaSlice<u8> = stream.alloc_zeros::<u8>(n as usize * 16)?;
-
     let block_dim: u32 = 64;
     let grid_dim: u32 = n.div_ceil(block_dim);
     let cfg = LaunchConfig {
@@ -279,99 +245,73 @@ pub fn gpu_aes256_decrypt(ctx: &CudaCtx, keys: &[u8], cts: &[u8]) -> Result<Vec<
     Ok(stream.clone_dtoh(&dev_pts)?)
 }
 
-// ----- Kernel de barrido principal -----
+// ----- Kernel ÚNICO de barrido (D-029) -----
 
-/// 14 PTX precompilados, uno por KDF (Fase 3 = 0..8, Fase 3.5 = 9..13).
-/// Indexado por `Kdf::id()`.
-const PTX_BRUTE: [&str; 14] = [
-    include_str!(concat!(env!("OUT_DIR"), "/brute_0.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_1.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_2.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_3.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_4.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_5.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_6.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_7.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_8.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_9.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_10.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_11.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_12.ptx")),
-    include_str!(concat!(env!("OUT_DIR"), "/brute_13.ptx")),
-];
+/// PTX único, embebido en el binario.
+const PTX_BRUTE: &str = include_str!(concat!(env!("OUT_DIR"), "/brute_md5hex_aes256_ecb.ptx"));
 
-/// Tamaño de un `DeviceHit` empaquetado en el orden del struct C++.
-/// `u64 + u32 + u32 = 16 B` con alineación natural.
-const DEVICE_HIT_BYTES: usize = 16;
+/// Tamaño de un `DeviceHit` empaquetado: solo `u64 idx` = 8 B.
+const DEVICE_HIT_BYTES: usize = 8;
 
-/// Bundle pre-cargado para un KDF concreto. Reutiliza buffers entre
-/// llamadas consecutivas a `launch` para evitar allocaciones en el hot loop.
+/// Block dim compilada en `__launch_bounds__`. Debe coincidir.
+pub const QC_BLOCK_DIM: u32 = 128;
+
+/// N candidatas por thread en la stride-loop interna (D-024).
+const QC_N_PER_THREAD: u64 = 8;
+
+/// Cap absoluto de bloques por launch (D-024).
+const QC_MAX_GRID_BLOCKS: u32 = 4_096;
+
+/// Bundle pre-cargado del único kernel activo. Reutiliza buffers entre
+/// llamadas a `launch` para evitar allocaciones en el hot loop.
 pub struct KernelBundle {
-    kdf: Kdf,
     stream: Arc<CudaStream>,
     func: CudaFunction,
-    iv_dev: CudaSlice<u8>,
+    block_dim: u32,
     ct_block_dev: CudaSlice<u8>,
     hits_dev: CudaSlice<u8>,
     counter_dev: CudaSlice<u32>,
 }
 
 impl KernelBundle {
-    pub fn load(ctx: &CudaCtx, kdf: Kdf) -> Result<Self> {
+    /// Carga el único kernel activo (D-029). Sin parámetros.
+    pub fn load(ctx: &CudaCtx) -> Result<Self> {
         let stream = ctx.stream().clone();
-        let id = kdf.id() as usize;
-        if id >= PTX_BRUTE.len() {
-            return Err(anyhow!("kdf id {id} fuera de rango"));
-        }
-        let module = ctx.raw_ctx().load_module(Ptx::from_src(PTX_BRUTE[id]))?;
+        let module = ctx.raw_ctx().load_module(Ptx::from_src(PTX_BRUTE))?;
         let func = module.load_function("brute_kernel")?;
 
-        let iv_dev = stream.alloc_zeros::<u8>(16)?;
         let ct_block_dev = stream.alloc_zeros::<u8>(16)?;
         let hits_dev = stream.alloc_zeros::<u8>(HITS_CAPACITY as usize * DEVICE_HIT_BYTES)?;
         let counter_dev = stream.alloc_zeros::<u32>(1)?;
 
         Ok(Self {
-            kdf,
             stream,
             func,
-            iv_dev,
+            block_dim: QC_BLOCK_DIM,
             ct_block_dev,
             hits_dev,
             counter_dev,
         })
     }
 
-    pub fn kdf(&self) -> Kdf {
-        self.kdf
-    }
-
     /// Lanza un batch de tamaño `idx_count` empezando en `idx_base`.
-    /// `iv_bytes` se usa solo si `iv.iv_mode() == 0` (first16); para zeros
-    /// se ignora y para md5pw lo calcula el kernel.
+    /// `ct_block_0` son los primeros 16 B del fichero objetivo (en ECB,
+    /// el primer bloque de ciphertext).
     pub fn launch(
         &mut self,
         idx_base: u64,
         idx_count: u64,
-        iv_bytes: &[u8; 16],
-        iv: IvSource,
         ct_block_0: &[u8; 16],
     ) -> Result<Vec<DeviceHit>> {
         let stream = self.stream.clone();
 
-        // Reset counter y empuja IV + CT a device.
         stream.memset_zeros(&mut self.counter_dev)?;
-        stream.memcpy_htod(iv_bytes.as_slice(), &mut self.iv_dev)?;
         stream.memcpy_htod(ct_block_0.as_slice(), &mut self.ct_block_dev)?;
 
-        // Dimensiona grid. PERF: 128 threads/block balancea register pressure
-        // (~96 regs/thread tras unroll AES) con occupancy. sm_120 acepta
-        // grid_dim.x hasta 2^31-1; aun así capamos a 524 288 blocks (= 64M
-        // threads) para no agotar contadores y porque el stride loop cubre
-        // batches mayores con menos overhead de lanzamiento.
-        let block_dim: u32 = 128;
-        let needed_blocks = idx_count.div_ceil(block_dim as u64);
-        let grid_dim: u32 = needed_blocks.min(524_288) as u32;
+        let block_dim: u32 = self.block_dim;
+        let n_per_thread = QC_N_PER_THREAD;
+        let needed_blocks = idx_count.div_ceil((block_dim as u64) * n_per_thread);
+        let grid_dim: u32 = needed_blocks.clamp(1, QC_MAX_GRID_BLOCKS as u64) as u32;
 
         let cfg = LaunchConfig {
             grid_dim: (grid_dim, 1, 1),
@@ -379,14 +319,11 @@ impl KernelBundle {
             shared_mem_bytes: 0,
         };
 
-        let iv_mode: u32 = iv.iv_mode();
         let capacity: u32 = HITS_CAPACITY;
 
         let mut launch = stream.launch_builder(&self.func);
         launch.arg(&idx_base);
         launch.arg(&idx_count);
-        launch.arg(&self.iv_dev);
-        launch.arg(&iv_mode);
         launch.arg(&self.ct_block_dev);
         launch.arg(&mut self.hits_dev);
         launch.arg(&mut self.counter_dev);
@@ -409,9 +346,7 @@ impl KernelBundle {
         for i in 0..(count as usize) {
             let off = i * DEVICE_HIT_BYTES;
             let idx = u64::from_le_bytes(hits_bytes[off..off + 8].try_into().unwrap());
-            let kdf_id = u32::from_le_bytes(hits_bytes[off + 8..off + 12].try_into().unwrap());
-            let iv_id = u32::from_le_bytes(hits_bytes[off + 12..off + 16].try_into().unwrap());
-            hits.push(DeviceHit { idx, kdf_id, iv_id });
+            hits.push(DeviceHit { idx });
         }
         Ok(hits)
     }
@@ -421,11 +356,54 @@ impl KernelBundle {
 const PTX_FORCE_EMIT_HITS: &str =
     include_str!(concat!(env!("OUT_DIR"), "/force_emit_hits.ptx"));
 
-/// Lanza el kernel `force_emit_hits` que emite `n_target` hits sintéticos.
-/// Devuelve `(reported_count, hits)`. Si `reported_count > capacity`, el
-/// caller decide qué hacer (típicamente: rechazar el batch).
+/// PTX del kernel auxiliar `dump_pt_block0` para tests bit-exact.
+const PTX_DUMP_PT_BLOCK0: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/dump_pt_block0.ptx"));
+
+/// Vuelca el plaintext del primer bloque (16 B) bajo md5hex_full +
+/// AES-256-ECB para cada idx en `[idx_base, idx_base+idx_count)`.
+/// Usado por `test_optimized_kernel_matches_baseline`.
+pub fn gpu_dump_pt_block0(
+    ctx: &CudaCtx,
+    idx_base: u64,
+    idx_count: u64,
+    ct_block_0: &[u8; 16],
+) -> Result<Vec<u8>> {
+    let stream = ctx.stream().clone();
+    let module = ctx
+        .raw_ctx()
+        .load_module(Ptx::from_src(PTX_DUMP_PT_BLOCK0))?;
+    let func = module.load_function("dump_pt_block0")?;
+
+    let ct_dev = stream.clone_htod(ct_block_0.as_slice())?;
+    let total_bytes = (idx_count as usize) * 16;
+    let mut pt_dev: CudaSlice<u8> = stream.alloc_zeros::<u8>(total_bytes)?;
+
+    let block_dim: u32 = 128;
+    let grid_dim: u32 = idx_count.div_ceil(block_dim as u64) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_dim, 1, 1),
+        block_dim: (block_dim, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut launch = stream.launch_builder(&func);
+    launch.arg(&idx_base);
+    launch.arg(&idx_count);
+    launch.arg(&ct_dev);
+    launch.arg(&mut pt_dev);
+    unsafe { launch.launch(cfg) }?;
+
+    stream.synchronize()?;
+    Ok(stream.clone_dtoh(&pt_dev)?)
+}
+
+/// Lanza el kernel `force_emit_hits` que emite `n_target` hits
+/// sintéticos. Tras D-029, `DeviceHit` ya solo tiene `idx`, así que el
+/// kernel sintético sigue siendo compatible (escribe `idx = tid`).
 ///
-/// Útil **solo para tests** — no forma parte del barrido de producción.
+/// Devuelve `(reported_count, hits)`. Si `reported_count > capacity`,
+/// el caller decide qué hacer.
 pub fn gpu_force_emit_hits(
     ctx: &CudaCtx,
     n_target: u32,
@@ -435,7 +413,7 @@ pub fn gpu_force_emit_hits(
     let func = module.load_function("force_emit_hits")?;
 
     let mut hits_dev: CudaSlice<u8> =
-        stream.alloc_zeros::<u8>(HITS_CAPACITY as usize * DEVICE_HIT_BYTES)?;
+        stream.alloc_zeros::<u8>(HITS_CAPACITY as usize * 16)?; // legacy 16 B
     let mut counter_dev: CudaSlice<u32> = stream.alloc_zeros::<u32>(1)?;
     stream.memset_zeros(&mut counter_dev)?;
 
@@ -463,21 +441,12 @@ pub fn gpu_force_emit_hits(
 
     let n_to_read = count.min(HITS_CAPACITY) as usize;
     let mut hits = Vec::with_capacity(n_to_read);
+    // El kernel legacy `force_emit_hits.cu` emite struct legacy de
+    // 16 B (idx, kdf_id, iv_id). Tras D-029 solo nos interesa el `idx`.
     for i in 0..n_to_read {
-        let off = i * DEVICE_HIT_BYTES;
+        let off = i * 16;
         let idx = u64::from_le_bytes(hits_bytes[off..off + 8].try_into().unwrap());
-        let kdf_id = u32::from_le_bytes(hits_bytes[off + 8..off + 12].try_into().unwrap());
-        let iv_id = u32::from_le_bytes(hits_bytes[off + 12..off + 16].try_into().unwrap());
-        hits.push(DeviceHit { idx, kdf_id, iv_id });
+        hits.push(DeviceHit { idx });
     }
     Ok((count, hits))
-}
-
-/// Resuelve el IV efectivo para un launch dado (bytes que se mandan al device).
-pub fn resolve_iv_bytes(iv: IvSource, file_iv: &[u8; 16]) -> [u8; 16] {
-    match iv {
-        IvSource::First16 => *file_iv,
-        IvSource::Zeros => [0u8; 16],
-        IvSource::Md5Pw => [0u8; 16], // ignorado por el kernel, lo calcula in-device
-    }
 }

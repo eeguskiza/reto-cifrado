@@ -378,6 +378,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ecb"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a8bfa975b1aec2145850fcaa1c6fe269a16578c44705a532ae3edc92b8881c7"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -861,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "quattro-crack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -873,6 +882,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "cudarc",
+ "ecb",
  "hex",
  "indicatif",
  "md-5",

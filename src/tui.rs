@@ -183,11 +183,10 @@ struct State {
     total_processed: u64,
     peak_ghs: f64,
     cfg_processed: u64,
-    cfg_started_step: u64,
     last_step: u64,
     n_total: u64,
+    #[allow(dead_code)]
     total_configs: usize,
-    current_config: usize,
     hits: usize,
     last_sample_idx: u64,
     last_sample_pw: String,
@@ -215,7 +214,7 @@ fn run_renderer(rx: Receiver<ProgressEvent>, cfg: TuiSinkConfig) {
 
     // Cabecera estática.
     let _ = mp.println(format!(
-        "quattro-crack v{} — N = {} — AES-CBC (PKCS7), confirmed",
+        "quattro-crack v{} — N = {} — AES-256-ECB (PKCS7), md5hex_full",
         cfg.project_version, cfg.n_total_candidates
     ));
 
@@ -256,65 +255,34 @@ fn run_renderer(rx: Receiver<ProgressEvent>, cfg: TuiSinkConfig) {
 fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiProgress) {
     match event {
         ProgressEvent::PlanLoaded {
-            total_configs,
             total_candidates,
-            preset_name,
             batch_size,
             device_name,
+            config_id,
             ..
         } => {
-            st.total_configs = total_configs;
+            // Tras D-029 hay una sola config implícita; mantenemos el
+            // bar `[Plan]` por simetría visual pero queda como "0/1" /
+            // "1/1" según estado.
+            st.total_configs = 1;
             st.n_total = total_candidates;
             st.started_at = Some(Instant::now());
-            bars.plan.set_length(total_configs as u64);
-            bars.plan.set_message(format!(
-                "0/{total_configs} configurations  ·  preset: {}",
-                preset_name.as_deref().unwrap_or("custom")
-            ));
+            st.cfg_started_at = Some(Instant::now());
+            bars.plan.set_length(1);
+            bars.plan.set_message("0/1 configurations  ·  D-029 single");
+            bars.config_line.set_message(config_id.clone() + "  ·  AES-256");
             bars.space.set_length(total_candidates);
             let _ = mp.println(format!(
-                "device: {device_name}  ·  batch_size: {batch_size}  ·  configs: {total_configs}"
+                "device: {device_name}  ·  batch_size: {batch_size}  ·  config: {config_id}"
             ));
         }
-        ProgressEvent::Resumed {
-            config_idx,
-            from_step,
-        } => {
-            st.current_config = config_idx;
+        ProgressEvent::Resumed { from_step } => {
             st.last_step = from_step;
-            let _ = mp.println(format!(
-                "[reanuda] desde cfg {} en idx {}",
-                config_idx + 1,
-                from_step
-            ));
+            let _ = mp.println(format!("[reanuda] desde idx {from_step}"));
         }
         ProgressEvent::ResumeRejected { reason } => {
             let _ = mp.println(format!("[resume rechazado] {reason}"));
             st.finished = true;
-        }
-        ProgressEvent::ConfigStarted {
-            idx,
-            total,
-            kdf,
-            iv,
-            klen,
-            start_step,
-        } => {
-            st.current_config = idx;
-            st.cfg_started_at = Some(Instant::now());
-            st.cfg_started_step = start_step;
-            st.cfg_processed = 0;
-            bars.plan.set_position(idx as u64);
-            bars.plan.set_message(format!(
-                "{}/{} configurations",
-                idx + 1,
-                total
-            ));
-            bars.config_line.set_message(format!(
-                "{kdf} / cbc / {iv}  ·  AES-{}",
-                klen * 8
-            ));
-            bars.space.set_position(start_step);
         }
         ProgressEvent::BatchCompleted {
             current_step,
@@ -420,75 +388,47 @@ fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiPro
             bars.gpu_line.set_message(format!("metrics unavailable ({reason})"));
         }
         ProgressEvent::HitConfirmed {
-            kdf,
             password,
             idx,
             plaintext_hex_first_32,
             elapsed_total,
-            ..
         } => {
             st.hits += 1;
             bars.hits_line
                 .set_message(format!("Hits found: {}", st.hits));
             let _ = mp.println(format!(
                 "================================================================\n\
-                 ★ HIT  cfg={kdf}  idx={idx}  pw='{password}'  elapsed={:.2}s\n\
+                 ★ HIT  idx={idx}  pw='{password}'  elapsed={:.2}s\n\
                  plaintext[..32]={plaintext_hex_first_32}\n\
                  ================================================================",
                 elapsed_total.as_secs_f64()
             ));
             st.finished = true;
         }
-        ProgressEvent::HitDiscardedPrefixMismatch { idx, .. } => {
-            // Sólo actualizamos la línea de "Last sample" para diagnóstico.
+        ProgressEvent::HitDiscardedPrefixMismatch { idx } => {
             bars.last_sample_line.set_message(format!(
                 "Last sample (idx={idx}):  (kernel false positive, prefix32 ≠ Leonardo da Vinc)"
             ));
         }
-        ProgressEvent::HitCriticalPkcs7Mismatch {
-            config_idx,
-            idx,
-            password,
-        } => {
+        ProgressEvent::HitCriticalPkcs7Mismatch { idx, password } => {
             let _ = mp.println(format!(
                 "================================================================\n\
-                 CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO  cfg={config_idx} idx={idx} pw='{password}'\n\
+                 CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO  idx={idx} pw='{password}'\n\
                  ABORTANDO el barrido. Estado guardado para inspección.\n\
                  ================================================================"
             ));
             st.finished = true;
         }
-        ProgressEvent::Paused {
-            config_idx,
-            last_step,
-            elapsed_total,
-        } => {
+        ProgressEvent::Paused { last_step, elapsed_total } => {
             let _ = mp.println(format!(
                 "================================================================\n\
-                 [PAUSED]  elapsed={:.2}s  last_config={}  last_step={}\n\
+                 [PAUSED]  elapsed={:.2}s  last_step={}\n\
                  resume:   quattro-crack run --resume\n\
                  ================================================================",
                 elapsed_total.as_secs_f64(),
-                config_idx,
                 last_step
             ));
             st.finished = true;
-        }
-        ProgressEvent::ConfigCompleted { idx, hits, .. } => {
-            bars.plan.set_position((idx + 1) as u64);
-            bars.plan.set_message(format!(
-                "{}/{} configurations",
-                idx + 1,
-                st.total_configs
-            ));
-            if hits > 0 {
-                let _ = mp.println(format!(
-                    "[cfg {}/{}] completada — {} hits",
-                    idx + 1,
-                    st.total_configs,
-                    hits
-                ));
-            }
         }
         ProgressEvent::PlanCompleted {
             total_hits,
@@ -518,15 +458,9 @@ fn tick(st: &mut State, bars: &Bars) {
     }
     if let Some(start) = st.started_at {
         let total_elapsed = now.duration_since(start);
-        let cfg_elapsed = st
-            .cfg_started_at
-            .map(|t| now.duration_since(t))
-            .unwrap_or_default();
         bars.elapsed_line.set_message(format!(
-            "Elapsed (config): {}  ·  Elapsed (total): {}  ·  Configs left: {}",
-            fmt_secs(cfg_elapsed.as_secs_f64()),
-            fmt_secs(total_elapsed.as_secs_f64()),
-            st.total_configs.saturating_sub(st.current_config + 1)
+            "Elapsed: {}",
+            fmt_secs(total_elapsed.as_secs_f64())
         ));
     }
 }

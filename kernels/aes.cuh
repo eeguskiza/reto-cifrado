@@ -141,14 +141,16 @@ __forceinline__ __device__ void aes128_set_key_with_tables(
             uint32_t t3 = rk[i*4 + 3]; rk[i*4 + 3] = rk[j + 3]; rk[j + 3] = t3;
         }
     }
-    (void)td0; (void)sbox;
+    // PERF (D-023): tras Fase 6, con launch_bounds + amortización de
+    // candidatas por thread la ruta SBOX→Td0 (5 instr/inv_mix con tablas
+    // en __shared__) gana al gmul-loop unrolled (~130 instr/inv_mix puro
+    // ALU). Cuando el bottleneck era register pressure ganaba el ALU
+    // (D-009); con occupancy mayor el cost shift es a favor de menos
+    // instrucciones. 36 calls × ~125 instr ahorradas por candidata ≈
+    // 4500 instr menos por candidata.
     #pragma unroll
     for (int idx = 4; idx < 40; ++idx) {
-        // PERF: el kernel gmul-loop unrolled es más rápido en sm_120 que la
-        // ruta SBOX→Td0 (medido: 1.57 GH/s vs 1.25 GH/s). El compilador
-        // colapsa los 8 XOR-conditionals a ~8 instrucciones bit-a-bit y se
-        // mantiene en registros.
-        rk[idx] = aes_inv_mix_column(rk[idx]);
+        rk[idx] = aes_inv_mix_column_via_td0(rk[idx], td0, sbox);
     }
 }
 
@@ -194,10 +196,9 @@ __forceinline__ __device__ void aes192_set_key_with_tables(
             uint32_t t3 = rk[i*4 + 3]; rk[i*4 + 3] = rk[j + 3]; rk[j + 3] = t3;
         }
     }
-    (void)td0; (void)sbox;
     #pragma unroll
     for (int idx = 4; idx < 48; ++idx) {
-        rk[idx] = aes_inv_mix_column(rk[idx]);
+        rk[idx] = aes_inv_mix_column_via_td0(rk[idx], td0, sbox);
     }
 }
 
@@ -241,10 +242,9 @@ __forceinline__ __device__ void aes256_set_key_with_tables(
             uint32_t t3 = rk[i*4 + 3]; rk[i*4 + 3] = rk[j + 3]; rk[j + 3] = t3;
         }
     }
-    (void)td0; (void)sbox;
     #pragma unroll
     for (int idx = 4; idx < 56; ++idx) {
-        rk[idx] = aes_inv_mix_column(rk[idx]);
+        rk[idx] = aes_inv_mix_column_via_td0(rk[idx], td0, sbox);
     }
 }
 
