@@ -1,16 +1,30 @@
 # quattro-crack
 
-Brute-force CUDA contra **AES-CBC + PKCS7** con MD5 + estructura de password
-conocida.
+Brute-force CUDA contra **AES-256-ECB + PKCS7** con `md5hex_full` como
+única KDF y estructura de password conocida.
 
-> Estado: **Fase 5 completada**. TUI en vivo desacoplada del runner por
-> canal `crossbeam_channel::unbounded` (D-019). Runner emite
-> `ProgressEvent`; dos sinks intercambiables: `StderrSink` (replica
-> Fase 4 línea a línea) y `TuiSink` (`indicatif` + `crossterm` con
-> Plan/Space/Speed bars y métricas NVML). Auto-detect TTY con
-> `std::io::IsTerminal` (D-020). Logs estructurados (compact, D-018)
-> a `./logs/run-*.log` vía `tracing-appender`. Throughput intacto a
-> ~1.2 GH/s — deuda de Fase 6 (D-012).
+> Estado: **Fase 8 (D-029) completada**. El autor del reto confirmó
+> oficialmente la construcción criptográfica final:
+>
+> - **Modo:** AES-256-ECB con padding PKCS7
+> - **KDF:** `key = MD5(password.encode("utf-8")).hexdigest().encode("ascii")`
+>   → 32 B ASCII
+> - **IV:** ninguno (ECB)
+>
+> Tras el refactor el barrido tiene **una única configuración**, un
+> único PTX (`brute_md5hex_aes256_ecb.cu`) y la CLI ya no expone
+> presets ni KDFs alternativas. Las 13 KDFs anteriores y el path CBC
+> sobreviven como código auxiliar de tests (`kdf::legacy::*`,
+> `reference::{decrypt,encrypt}_cbc_*` con `#[doc(hidden)]`). El
+> kernel monolítico sostiene **1,48 GH/s avg / 1,82 GH/s peak** sobre
+> 30 s de benchmark (vs 1,76 GH/s avg de md5hex_full bajo el kernel
+> multi-KDF anterior — ver D-029).
+>
+> 81 tests verdes + 10 ignorados (diagnóstico opt-in). Clippy limpio
+> con `-D warnings`. ETA del barrido único a 1,48 GH/s avg ≈ **11,2 h**.
+>
+> Optimizaciones D-025 (batch 64 Mi default), D-026 (flush agrupado
+> cada 8 batches) y D-027 (NVML shim WSL2) heredadas y vigentes.
 
 ## Estructura del password objetivo
 
@@ -31,45 +45,19 @@ Cardinalidad del espacio:
 70 × 625 × 194 481 × 7 × 1000 = 59 559 806 250 000  ≈ 5.96 × 10¹³
 ```
 
-## Modo de cifrado (confirmado)
+## Construcción criptográfica (confirmada por el autor — D-029)
 
-**AES-CBC con padding PKCS7**, AES-128 ó AES-256 según la KDF (16 ó 32 B
-de clave). Confirmado por el autor del reto. El proyecto **solo soporta
-CBC**, no es deuda técnica (ver `DECISIONS.md` D-006).
+```
+key  = MD5(password.encode("utf-8")).hexdigest().encode("ascii")  # 32 B AES-256
+mode = AES-256-ECB
+pad  = PKCS7
+```
 
-## KDFs soportadas (14)
+ECB no usa IV. El fichero objetivo (`./data/cifrado.txt`) son **1616 B
+de ciphertext puros**, decodificados desde base64, divididos en
+**101 bloques AES de 16 B**.
 
-**Originales (Fase 2/3) — IDs 0..8**:
-
-| ID  | Nombre        | Definición                                  | klen | AES  |
-|-----|---------------|---------------------------------------------|------|------|
-| 0   | `md5_utf8`    | `MD5(pw_utf8)`                              | 16 B | 128  |
-| 1   | `md5_utf16le` | `MD5(pw_utf16le)`                           | 16 B | 128  |
-| 2   | `md5_utf16be` | `MD5(pw_utf16be)`                           | 16 B | 128  |
-| 3   | `md5x2_utf8`  | `MD5(MD5(pw_utf8))`                         | 16 B | 128  |
-| 4   | `md5_dup`     | `MD5(pw_utf8) ‖ MD5(pw_utf8)`               | 32 B | 256  |
-| 5   | `md5_md5rev`  | `MD5(pw_utf8) ‖ MD5(pw_utf8)[::-1]`         | 32 B | 256  |
-| 6   | `md5hex_full` | hexdigest ASCII completo                    | 32 B | 256  |
-| 7   | `md5hex_lo16` | primeros 16 chars del hexdigest             | 16 B | 128  |
-| 8   | `pw_padded`   | `(pw_utf8 + b"\0"*16)[:16]`                 | 16 B | 128  |
-
-**Ampliación académica (Fase 3.5) — IDs 9..13**:
-
-| ID  | Nombre                    | Definición                                                  | klen | AES  |
-|-----|---------------------------|-------------------------------------------------------------|------|------|
-| 9   | `evp_md5_aes256_nosalt`   | `EVP_BytesToKey(MD5, pw, salt=None, iter=1)[..32]`          | 32 B | 256  |
-| 10  | `evp_md5_aes192_nosalt`   | mismo, truncado a 24 B                                       | 24 B | 192  |
-| 11  | `md5_trunc24`             | `MD5(pw) ‖ MD5(pw)[..8]`                                     | 24 B | 192  |
-| 12  | `md5_md5x2_24`            | `MD5(pw) ‖ MD5(MD5(pw))[..8]`                                | 24 B | 192  |
-| 13  | `md5hex_lo24`             | primeros 24 chars ASCII de `hexdigest`                       | 24 B | 192  |
-
-IVs: `first16` (los 16 primeros B del fichero), `zeros`, `md5pw`.
-
-Plan total: 14 KDFs × 1 modo × 3 IVs = **42 configuraciones** ordenadas
-por probabilidad descendente. Las 27 originales forman prefijo estricto
-del plan extendido (D-014). Ver `DECISIONS.md` D-008 y D-014.
-
-## Validación de hit (3 pasos)
+## Validación de hit (3 pasos, D-007 vigente)
 
 Una clave es hit confirmado solo si:
 
@@ -77,8 +65,7 @@ Una clave es hit confirmado solo si:
 2. primeros 32 B del PT = `Leonardo da Vinci\r\nLeonardo da V` (CPU)
 3. padding PKCS7 del último bloque válido (CPU)
 
-(2)+(3) descartan los falsos positivos del kernel (≈ 2⁻¹²⁸ por candidata).
-Si pasa (1)+(2) pero falla (3) → bug; el runner aborta.
+Si pasa (1)+(2) pero falla (3) → bug crítico, runner aborta.
 
 ## Build
 
@@ -87,83 +74,120 @@ cargo build --release
 cargo test --release
 ```
 
-## Uso actual
+## Uso
 
 ```bash
-# Inspeccionar fichero objetivo
-cargo run --release -- inspect ./data/cifrado.txt
+# Inspeccionar fichero objetivo (sin IV, ECB)
+quattro-crack inspect ./data/cifrado.txt
 
-# Ver plan resuelto para cada preset
-cargo run --release -- plan --preset canonical
-cargo run --release -- plan --preset likely
-cargo run --release -- plan --preset exhaustive
+# Ver el plan único
+quattro-crack plan
 
-# Persistir plan en state/plan.toml (formato definitivo)
-cargo run --release -- plan --preset exhaustive --save
+# Persistir plan en state/plan.toml
+quattro-crack plan --save
 
-# Ver estado actual (plan + progreso si existe)
-cargo run --release -- status
+# Ver estado actual (plan + progreso)
+quattro-crack status
+
+# Lanzar el barrido (plan único, sin presets)
+quattro-crack run
+
+# Reanudar tras pausa
+quattro-crack run --resume
+
+# Borrar state (incluido state legacy pre-D-029)
+quattro-crack reset --yes
 ```
 
-## Presets
+## Tiempos estimados
 
-| Preset       | Configs | Estimación @ 10 GH/s | Estimación @ 1.2 GH/s (medido) |
-|--------------|---------|----------------------|--------------------------------|
-| `canonical`  | 4       | ~1,5 h               | ~13 h                          |
-| `likely`     | 12      | ~5 h                  | ~42 h                          |
-| `exhaustive` | 42      | ~15 h *(default)*     | ~5 días                        |
+ETA = N / throughput (espacio único, sin presets).
 
-Las estimaciones a 10 GH/s son las de la spec. La columna real refleja la
-medición actual de Fase 3 (~1.2 GH/s); Fase 6 cierra el gap.
+| Throughput                     | ETA                  |
+|--------------------------------|----------------------|
+| 1,48 GH/s avg (medido D-029)   | ~11,2 h ≈ 0,47 días  |
+| 1,82 GH/s peak                 | ~9,1 h               |
+| 1,26 GH/s runner real (hot)    | ~13,1 h              |
+
+vs baseline pre-D-029: el plan exhaustive de 42 configs tardaba
+~37 h ≈ 1,5 días, así que el refactor da un **speedup × 3** efectivo
+(no por kernel más rápido, sino por 1 paso del espacio en lugar de 42).
+
+## Performance (post-D-029)
+
+Throughput del kernel único `brute_md5hex_aes256_ecb` (RTX 5070 Ti,
+sm_120, batch 128 Mi, 30 s sostenido):
+
+| Métrica  | GH/s     |
+|----------|----------|
+| avg      | **1,48** |
+| peak     | 1,82     |
+| median   | 1,42     |
+
+**Comparativa con el kernel multi-KDF anterior**:
+
+| Kernel                                  | KDF/path        | GH/s avg |
+|-----------------------------------------|-----------------|----------|
+| Multi-KDF Fase 6 (md5_utf8 / AES-128 / CBC) | más rápido  | 1,87     |
+| Multi-KDF Fase 6 (md5hex_full / AES-256 / CBC) | comparable | 1,76     |
+| **Único D-029 (md5hex_full / AES-256 / ECB)** | **activo** | **1,48 / 1,82 peak** |
+
+AES-256 es ~30 % más lento que AES-128 (14 rondas vs 10, rk de 60 vs
+44). La eliminación del dispatch IV/KDF aporta ~5 % vs el path
+md5hex+AES-256 multi-KDF anterior; el resto es coste estructural de
+AES-256 que no cambia. Ver D-029 para el análisis completo.
+
+## Cómo se compone el path activo
+
+```
+fichero base64 → 1616 B CT → CT[0..16] al kernel
+                                  ↓
+       idx ∈ [0, N) → password (gen.cuh, 14 B ASCII)
+                          ↓
+          MD5(pw) → 16 B raw → ASCII hex lowercase → 32 B key
+                                                          ↓
+                                  AES-256 key schedule (rk[60])
+                                                          ↓
+                                  AES-256 decrypt block (rk, CT[0..16])
+                                                          ↓
+                              compara 16 B vs "Leonardo da Vinc" (kernel)
+                                                          ↓
+                                                  match → atomic emit hit
+                                                          ↓
+                                  CPU: validate_hit (prefijo-32 + PKCS7)
+                                                          ↓
+                                                       Confirmed → exit
+```
 
 ## Roadmap
 
 - [x] Fase 0 — esqueleto + loader + `inspect`
-- [x] Fase 1 — generador combinatorio CPU (crítico)
+- [x] Fase 1 — generador combinatorio CPU
 - [x] Fase 2 — KDFs + descifrado CPU + plan + estado atómico + CLI ampliada
 - [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/192/256, brute parametrizado)
 - [x] Fase 4 — runner + checkpointing + reanudación + signal handling
 - [x] Fase 5 — TUI en vivo + tracing-appender (logs/) + auto-TTY
-- [ ] Fase 6 — optimización (warp-cooperative AES, MD5 vectorizado)
+- [x] Fase 6 — optimización kernel (launch_bounds + N/thread + Td0 invmix), 1.10 → 2.37 GH/s
+- [x] Fase 7 — flush agrupado + batch 64 Mi default + fix NVML WSL2: runner 0,91 → 1,88 GH/s
+- [x] Fase 8 (D-029) — refactor a única config (AES-256-ECB + md5hex_full), 81 tests verdes
+- [ ] Fase 9 (deuda) — cooperative AES intra-warp para empujar AES-256 hacia 2-3 GH/s
 
-## Uso interactivo (Fase 5)
-
-```bash
-# Con TTY: TUI en vivo (5 Hz, métricas NVML, ETA, peak/avg GH/s).
-quattro-crack run --preset canonical
-
-# Sin TUI (forzado): formato Fase 4 a stderr. Útil para CI / scripts.
-quattro-crack run --preset canonical --no-tui
-
-# Logs estructurados (compact, sin colores) a fichero por sesión.
-quattro-crack run --log-dir ./mis-logs    # default: ./logs/
-
-# Auto-detección: si stdout está redirigido (pipe, fichero), cae
-# automáticamente a StderrSink aunque no se pase --no-tui.
-quattro-crack run --preset canonical | tee salida.log
-```
-
-### Layout de la TUI
+## Layout de la TUI
 
 ```
-quattro-crack v0.x — N = 59559806250000 — AES-CBC (PKCS7), confirmed
-device: NVIDIA GeForce RTX 5070 Ti  ·  batch_size: 16777216  ·  configs: 42
+quattro-crack v0.2.0 — N = 59559806250000 — AES-256-ECB (PKCS7), md5hex_full
+device: NVIDIA GeForce RTX 5070 Ti  ·  batch_size: 67108864  ·  config: md5hex_full / aes-256-ecb / pkcs7
 
-[Plan]   ████████░░░░░░░░░░░░░░░░░░░░░░░░  3/42 configurations  ·  preset: exhaustive
-[Config] md5_utf16le / cbc / first16  ·  AES-128
-[Space]  ████████████████░░░░░░░░░░░░░░░░  62.4000%  3.71e13/5.96e13  ·  ETA 41m22s
-[Speed]  ████████████████████████░░░░░░░░  1.18 GH/s  (peak 1.24, avg 1.16)
+[Plan]   ████████████████████████████████  1/1 configurations  ·  D-029 single
+[Config] md5hex_full / aes-256-ecb / pkcs7  ·  AES-256
+[Space]  ████████░░░░░░░░░░░░░░░░░░░░░░░░  25.4000%  1.51e13/5.96e13  ·  ETA 8h22m
+[Speed]  ████████████████████████░░░░░░░░  1.48 GH/s  (peak 1.82, avg 1.45)
 [GPU]    util 98%  ·  mem 4.1/16.0 GB  ·  temp 71°C  ·  power 218W
-[State]  last flush 0.4s ago  ·  next_step 38712445312
+[State]  last flush 0.4s ago  ·  next_step 15123456789
                                                                        Hits found: 0
-                                          Elapsed (config): 1h12m  ·  Elapsed (total): 4h08m  ·  Configs left: 39
+                                                                  Elapsed: 2h47m
                                                           Press Ctrl+C to pause and save state safely.
 ```
-
-Cuando NVML no inicializa (driver muy nuevo o WSL2 con limitaciones),
-la línea `[GPU]` se sustituye por `metrics unavailable (<reason>)` y el
-barrido sigue intacto. Drop de `TuiSink` restaura cursor + colores
-incluso si la TUI cae a media pintada.
 
 ## Build CUDA
 
@@ -174,25 +198,17 @@ Prerequisitos:
 
 `build.rs` automáticamente:
 - Detecta `nvcc` (PATH, `NVCC`, `CUDA_HOME`, rutas estándar).
-- Comprueba si `nvcc` soporta `-arch=sm_120` (Blackwell). Si no, cae a
-  `sm_89` (Ada) y emite warning `cargo:warning=Compilando para sm_89...`.
-- Compila `kernels/brute.cu` **9 veces** (una por KDF) a PTX en `OUT_DIR`.
-- Compila los kernels auxiliares para tests (`dump_passwords`, `md5_test`,
-  `aes_test`, `force_emit_hits`).
-
-Verificación rápida:
-
-```bash
-cargo test --release --test cpu_gpu_parity        # paridad CPU↔GPU 1M
-cargo test --release --test md5_rfc1321           # MD5 RFC 1321
-cargo test --release --test aes_fips197           # AES NIST FIPS-197
-cargo test --release --test e2e_synthetic         # E2E + buffer hits
-```
+- Comprueba si soporta `-arch=sm_120` (Blackwell). Si no, cae a `sm_89` (Ada).
+- Compila **un único** `kernels/brute_md5hex_aes256_ecb.cu` (D-029) +
+  los kernels auxiliares de tests (`dump_passwords`, `md5_test`,
+  `aes_test`, `force_emit_hits`, `dump_pt_block0`).
 
 ## Troubleshooting WSL2
 
+### CUDA Toolkit (nvcc)
+
 A partir de Fase 3 hace falta `nvcc` (CUDA Toolkit) en WSL, **no solo el
-driver de Windows**. Comprobar con `nvcc --version`. Si falta:
+driver de Windows**:
 
 ```bash
 cd /tmp
@@ -205,5 +221,57 @@ echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH' >> ~/.
 source ~/.bashrc
 ```
 
-**No instales** `cuda-drivers-*` ni `nvidia-driver-*` en WSL: rompería la
-integración con el driver de Windows.
+**No instales** `cuda-drivers-*` ni `nvidia-driver-*` en WSL.
+
+### NVML — línea `[GPU] metrics unavailable` (D-027)
+
+WSL2 expone `libnvidia-ml.so.1` en `/usr/lib/wsl/lib/` pero no crea el
+symlink `libnvidia-ml.so`. Fix:
+
+```bash
+# Con sudo (recomendado, una vez por máquina):
+sudo ln -s /usr/lib/wsl/lib/libnvidia-ml.so.1 /usr/lib/wsl/lib/libnvidia-ml.so
+sudo ldconfig
+
+# Sin sudo (per-usuario):
+mkdir -p ~/lib-nvml-shim
+ln -sf /usr/lib/wsl/lib/libnvidia-ml.so.1 ~/lib-nvml-shim/libnvidia-ml.so
+echo 'export LD_LIBRARY_PATH=$HOME/lib-nvml-shim:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+El barrido funciona perfectamente sin NVML; solo se pierden las
+métricas decorativas de la TUI.
+
+### State legacy pre-D-029
+
+Si tienes un `state/plan.toml` o `state/progress.toml` de antes del
+refactor D-029 (con campos `entries`, `preset`, `per_config`,
+`current_config`...) el binario aborta con mensaje claro:
+
+```
+state/plan.toml pertenece a una versión incompatible (pre-D-029,
+formato multi-config). Lánzalo con `quattro-crack reset --yes` para
+empezar de cero, o renombra/copia el fichero si quieres conservarlo.
+```
+
+Para reanudar el barrido bajo el nuevo formato:
+
+```bash
+quattro-crack reset --yes        # borra state/ legacy
+quattro-crack run                # arranca plan único desde idx=0
+```
+
+## Benchmark
+
+```bash
+# Throughput sostenido del kernel único durante 30 s.
+quattro-crack benchmark --duration 30 --batch-size 134217728
+```
+
+Códigos de salida: 0 si ≥ 3 GH/s, 1 si entre 2–3 (warning), 2 si < 2.
+En el hardware actual el avg típico es 1,4–1,5 GH/s ⇒ exit code 2,
+esperado tras D-029 (AES-256 es estructuralmente ~30 % más lento que
+AES-128). Para un piso operacional usa el test
+`tests/optimized_kernel_parity.rs::test_throughput_meets_target` que
+exige ≥ 1,0 GH/s.

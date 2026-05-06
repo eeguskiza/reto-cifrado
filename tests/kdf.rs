@@ -1,91 +1,48 @@
-//! `test_kdf_vectors_vs_python` — vectores de validación de las 9 KDFs
-//! generados con `hashlib` de Python (CPython 3.12) en el momento de
-//! crear la fase 2. Si Python (especificación de jure de los formatos
-//! UTF-8/UTF-16) y nuestra implementación disienten, falla aquí.
+//! Vectores de validación de la **única KDF activa** (`md5hex_full`)
+//! contra `hashlib` de Python.
+//!
+//! Tras D-029 esta es la única KDF que importa para el barrido. Los
+//! vectores de las otras 13 KDFs viven en `tests/legacy_kdf.rs`.
 
-use quattro_crack::config::Kdf;
-use quattro_crack::kdf::derive;
+use quattro_crack::kdf::derive_md5hex;
 
-/// Triplas `(password, kdf, hexdigest_de_python)`.
+/// Triplas `(password, hex_lowercase_de_python)`.
 /// Generado con:
-///   python3 - <<'PY'
-///   import hashlib
-///   ... (ver tools de Fase 2)
-///   PY
-const VECTORS: &[(&str, Kdf, &str)] = &[
-    // pw = ".aAaabbbb1000."  (idx = 0, password documentado de la spec)
-    (".aAaabbbb1000.", Kdf::Md5Utf8,     "9ac15f8d5a92b3bc03a949212e6a6aed"),
-    (".aAaabbbb1000.", Kdf::Md5Utf16Le,  "94481c80c010cd8f200e791ccea7e61a"),
-    (".aAaabbbb1000.", Kdf::Md5Utf16Be,  "8bedc537a5dec2a34acad809db357ed7"),
-    (".aAaabbbb1000.", Kdf::Md5x2Utf8,   "fcffd97b40ba100bf1f51650022e7518"),
-    (".aAaabbbb1000.", Kdf::Md5Dup,      "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc03a949212e6a6aed"),
-    (".aAaabbbb1000.", Kdf::Md5Md5Rev,   "9ac15f8d5a92b3bc03a949212e6a6aeded6a6a2e2149a903bcb3925a8d5fc19a"),
-    (".aAaabbbb1000.", Kdf::Md5HexFull,  "3961633135663864356139326233626330336139343932313265366136616564"),
-    (".aAaabbbb1000.", Kdf::Md5HexLo16,  "39616331356638643561393262336263"),
-    (".aAaabbbb1000.", Kdf::PwPadded,    "2e6141616162626262313030302e0000"),
-
-    // pw = ".zzzzuuuU1999." (idx = N-1)
-    (".zzzzuuuU1999.", Kdf::Md5Utf8,     "9a3fbdba108501ac3f19bb7bee982974"),
-    (".zzzzuuuU1999.", Kdf::Md5Utf16Le,  "63f6e7d991173f6489febc383780ab42"),
-    (".zzzzuuuU1999.", Kdf::Md5Utf16Be,  "274d884fe1ce275a2ff73b7cacb46c30"),
-    (".zzzzuuuU1999.", Kdf::Md5x2Utf8,   "5ff6d2280f90df47a2ecfa618a1926a6"),
-    (".zzzzuuuU1999.", Kdf::Md5Dup,      "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac3f19bb7bee982974"),
-    (".zzzzuuuU1999.", Kdf::Md5Md5Rev,   "9a3fbdba108501ac3f19bb7bee982974742998ee7bbb193fac018510babd3f9a"),
-    (".zzzzuuuU1999.", Kdf::Md5HexFull,  "3961336662646261313038353031616333663139626237626565393832393734"),
-    (".zzzzuuuU1999.", Kdf::Md5HexLo16,  "39613366626462613130383530316163"),
-    (".zzzzuuuU1999.", Kdf::PwPadded,    "2e7a7a7a7a75757555313939392e0000"),
-
-    // pw = ".bAioembl1452." (random sample del espacio)
-    (".bAioembl1452.", Kdf::Md5Utf8,     "1289f8d7072cdede4f758cf77461c80a"),
-    (".bAioembl1452.", Kdf::Md5Utf16Le,  "1dffe05a6b912ad43795c89ded4e647a"),
-    (".bAioembl1452.", Kdf::Md5Utf16Be,  "1d803adcf89638814132f7c58dfa8937"),
-    (".bAioembl1452.", Kdf::Md5x2Utf8,   "6153594fc9a4970609948ed055d8858a"),
-    (".bAioembl1452.", Kdf::Md5Dup,      "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede4f758cf77461c80a"),
-    (".bAioembl1452.", Kdf::Md5Md5Rev,   "1289f8d7072cdede4f758cf77461c80a0ac86174f78c754fdede2c07d7f88912"),
-    (".bAioembl1452.", Kdf::Md5HexFull,  "3132383966386437303732636465646534663735386366373734363163383061"),
-    (".bAioembl1452.", Kdf::Md5HexLo16,  "31323839663864373037326364656465"),
-    (".bAioembl1452.", Kdf::PwPadded,    "2e6241696f656d626c313435322e0000"),
-
-    // ---------- Fase 3.5: 5 KDFs nuevas × 3 passwords ----------
-    // pw = ".aAaabbbb1000."
-    (".aAaabbbb1000.", Kdf::EvpMd5Aes256Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cbd9b4ed34eb9eaff1"),
-    (".aAaabbbb1000.", Kdf::EvpMd5Aes192Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cb"),
-    (".aAaabbbb1000.", Kdf::Md5Trunc24,         "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc"),
-    (".aAaabbbb1000.", Kdf::Md5Md5x2_24,        "9ac15f8d5a92b3bc03a949212e6a6aedfcffd97b40ba100b"),
-    (".aAaabbbb1000.", Kdf::Md5HexLo24,         "396163313566386435613932623362633033613934393231"),
-
-    // pw = ".zzzzuuuU1999."
-    (".zzzzuuuU1999.", Kdf::EvpMd5Aes256Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0682f1d54bba649b0"),
-    (".zzzzuuuU1999.", Kdf::EvpMd5Aes192Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0"),
-    (".zzzzuuuU1999.", Kdf::Md5Trunc24,         "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac"),
-    (".zzzzuuuU1999.", Kdf::Md5Md5x2_24,        "9a3fbdba108501ac3f19bb7bee9829745ff6d2280f90df47"),
-    (".zzzzuuuU1999.", Kdf::Md5HexLo24,         "396133666264626131303835303161633366313962623762"),
-
-    // pw = ".bAioembl1452."
-    (".bAioembl1452.", Kdf::EvpMd5Aes256Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2ee916658be60ddcfa"),
-    (".bAioembl1452.", Kdf::EvpMd5Aes192Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2e"),
-    (".bAioembl1452.", Kdf::Md5Trunc24,         "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede"),
-    (".bAioembl1452.", Kdf::Md5Md5x2_24,        "1289f8d7072cdede4f758cf77461c80a6153594fc9a49706"),
-    (".bAioembl1452.", Kdf::Md5HexLo24,         "313238396638643730373263646564653466373538636637"),
+///   python3 -c 'import hashlib; \
+///     [print(p, hashlib.md5(p.encode()).hexdigest()) \
+///      for p in (".aAaabbbb1000.", ".zzzzuuuU1999.", ".bAioembl1452.")]'
+const VECTORS_MD5HEX: &[(&str, &str)] = &[
+    (".aAaabbbb1000.", "9ac15f8d5a92b3bc03a949212e6a6aed"),
+    (".zzzzuuuU1999.", "9a3fbdba108501ac3f19bb7bee982974"),
+    (".bAioembl1452.", "1289f8d7072cdede4f758cf77461c80a"),
 ];
 
 #[test]
-fn test_kdf_vectors_vs_python() {
-    for (pw, kdf, expected_hex) in VECTORS {
-        let got = derive(*kdf, pw.as_bytes());
-        let got_hex = hex::encode(got.as_slice());
+fn test_md5hex_active_kdf_matches_python() {
+    for (pw, expected_md5_hex_lower) in VECTORS_MD5HEX {
+        // `derive_md5hex` produce los 32 B ASCII del hex lowercase del MD5.
+        // Esos 32 B, leídos como string ASCII, deben coincidir byte-a-byte
+        // con el hexdigest de Python.
+        let got = derive_md5hex(pw.as_bytes());
+        assert_eq!(got.len(), 32);
+        let got_str = std::str::from_utf8(&got).unwrap();
         assert_eq!(
-            &got_hex, expected_hex,
-            "KDF discrepa con Python para pw={pw:?} kdf={}",
-            kdf.as_str()
+            got_str, *expected_md5_hex_lower,
+            "md5hex_full discrepa con Python para pw={pw:?}"
         );
     }
 }
 
 #[test]
-fn test_all_9_kdfs_covered_by_vectors() {
-    for &kdf in Kdf::all() {
-        let count = VECTORS.iter().filter(|(_, k, _)| *k == kdf).count();
-        assert!(count >= 3, "kdf={} debería tener ≥3 vectores", kdf.as_str());
+fn test_md5hex_output_is_aes256_compatible() {
+    // 32 B = exactamente la longitud que pide AES-256.
+    let key = derive_md5hex(b".aAabbabb1000.");
+    assert_eq!(key.len(), 32, "AES-256 requiere clave de 32 B");
+    // Cada byte debe estar en el rango ASCII de hex lowercase.
+    for &b in &key {
+        assert!(
+            b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+            "byte {b:#04x} fuera del rango ASCII hex lowercase"
+        );
     }
 }

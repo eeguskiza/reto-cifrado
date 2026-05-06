@@ -1,4 +1,4 @@
-//! Tests Fase 5 — TUI desacoplada del runner.
+//! Tests Fase 5 + adaptados a D-029.
 
 use std::io::Write;
 use std::path::Path;
@@ -10,44 +10,40 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use tempfile::TempDir;
 
-use quattro_crack::config::{ConfigEntry, IvSource, Kdf};
-use quattro_crack::kdf::derive;
-use quattro_crack::reference::{encrypt_cbc_pkcs7, KNOWN_PREFIX_32};
+use quattro_crack::kdf::derive_md5hex;
+use quattro_crack::reference::{encrypt_ecb_pkcs7, KNOWN_PREFIX_32};
 use quattro_crack::runner::{ProgressEvent, ProgressSink, StderrSink};
 use quattro_crack::tui::{TuiSink, TuiSinkConfig};
 
 const QC_BIN: &str = env!("CARGO_BIN_EXE_quattro-crack");
 
-fn build_pt_1584() -> Vec<u8> {
-    let mut pt = Vec::with_capacity(1584);
+fn build_pt_1600() -> Vec<u8> {
+    let mut pt = Vec::with_capacity(1600);
     pt.extend_from_slice(KNOWN_PREFIX_32);
-    while pt.len() < 1584 {
+    while pt.len() < 1600 {
         pt.push(b'X');
     }
     pt
 }
 
-fn write_cifrado(path: &Path, iv: &[u8; 16], ct: &[u8]) {
-    let mut bin = Vec::with_capacity(16 + ct.len());
-    bin.extend_from_slice(iv);
-    bin.extend_from_slice(ct);
-    std::fs::write(path, STANDARD.encode(&bin)).unwrap();
+fn write_cifrado_ecb(path: &Path, ct_1616: &[u8]) {
+    assert_eq!(ct_1616.len(), 1616);
+    std::fs::write(path, STANDARD.encode(ct_1616)).unwrap();
 }
 
 #[test]
-fn test_stderr_sink_emits_same_format_as_phase4() {
+fn test_stderr_sink_emits_phase4_compatible_format() {
     // Setup: target_idx muy bajo para que el run termine rápido.
     let pw = b".aAaabbbb1000.";
-    let key = derive(Kdf::Md5Utf8, pw);
-    let iv = [0u8; 16];
-    let pt = build_pt_1584();
-    let ct = encrypt_cbc_pkcs7(key.as_slice(), &iv, &pt).unwrap();
+    let key = derive_md5hex(pw);
+    let pt = build_pt_1600();
+    let ct = encrypt_ecb_pkcs7(&key, &pt);
 
     let tmp = TempDir::new().unwrap();
     let input_path = tmp.path().join("cifrado.txt");
     let state_dir = tmp.path().join("state");
     let log_dir = tmp.path().join("logs");
-    write_cifrado(&input_path, &iv, &ct);
+    write_cifrado_ecb(&input_path, &ct);
 
     let output = Command::new(QC_BIN)
         .args([
@@ -59,30 +55,27 @@ fn test_stderr_sink_emits_same_format_as_phase4() {
             state_dir.to_str().unwrap(),
             "--log-dir",
             log_dir.to_str().unwrap(),
-            "--preset",
-            "canonical",
             "--batch-size",
             "1000000",
+            "--flush-every",
+            "1",
         ])
         .output()
         .expect("spawn run --no-tui");
     assert!(output.status.success(), "run debería terminar limpio: {output:?}");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Patrones clave que Fase 4 emitía y que --no-tui debe seguir emitiendo.
     assert!(stderr.contains("device:"), "header device: ausente:\n{stderr}");
     assert!(stderr.contains("plan:"), "header plan: ausente");
     assert!(
-        stderr.contains("[cfg 1/4]") && stderr.contains("md5_utf8/cbc/first16"),
-        "config-start pattern ausente:\n{stderr}"
+        stderr.contains("md5hex_full"),
+        "no aparece la única config (md5hex_full):\n{stderr}"
     );
     assert!(
         stderr.contains("HIT CONFIRMADO") || stderr.contains("plan completado"),
         "ni HIT ni completion pattern:\n{stderr}"
     );
 
-    // Verificación adicional: el log de tracing existe.
     let logs: Vec<_> = std::fs::read_dir(&log_dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -94,7 +87,6 @@ fn test_stderr_sink_emits_same_format_as_phase4() {
     );
 }
 
-/// Buffer-writer sink para verificar formato sin spawnear subproceso.
 fn capture_with_stderr_sink(events: &[ProgressEvent]) -> String {
     struct W(Arc<Mutex<Vec<u8>>>);
     impl Write for W {
@@ -116,34 +108,18 @@ fn capture_with_stderr_sink(events: &[ProgressEvent]) -> String {
 }
 
 #[test]
-fn test_progress_event_serialization() {
-    // Cada variante puede construirse y debug-imprimirse.
+fn test_progress_events_serialize_after_d029() {
     let events: Vec<ProgressEvent> = vec![
         ProgressEvent::PlanLoaded {
-            total_configs: 4,
             total_candidates: 1_000_000,
             source_sha256: "deadbeef".into(),
-            preset_name: Some("canonical".into()),
             batch_size: 1024,
             device_name: "GPU".into(),
+            config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
         },
-        ProgressEvent::Resumed {
-            config_idx: 0,
-            from_step: 100,
-        },
-        ProgressEvent::ResumeRejected {
-            reason: "x".into(),
-        },
-        ProgressEvent::ConfigStarted {
-            idx: 0,
-            total: 4,
-            kdf: "md5_utf8".into(),
-            iv: "first16".into(),
-            klen: 16,
-            start_step: 0,
-        },
+        ProgressEvent::Resumed { from_step: 100 },
+        ProgressEvent::ResumeRejected { reason: "x".into() },
         ProgressEvent::BatchCompleted {
-            config_idx: 0,
             batch_num: 10,
             current_step: 1000,
             candidates_in_batch: 100,
@@ -156,36 +132,21 @@ fn test_progress_event_serialization() {
             temperature_c: 60,
             power_w: 200,
         },
-        ProgressEvent::GpuMetricsUnavailable {
-            reason: "test".into(),
-        },
+        ProgressEvent::GpuMetricsUnavailable { reason: "test".into() },
         ProgressEvent::HitConfirmed {
-            config_idx: 0,
-            kdf: "md5_utf8".into(),
             password: "x".into(),
             idx: 1,
             plaintext_hex_first_32: "ab".into(),
             elapsed_total: Duration::from_secs(1),
         },
-        ProgressEvent::HitDiscardedPrefixMismatch {
-            config_idx: 0,
-            idx: 1,
-        },
+        ProgressEvent::HitDiscardedPrefixMismatch { idx: 1 },
         ProgressEvent::HitCriticalPkcs7Mismatch {
-            config_idx: 0,
             idx: 1,
             password: "x".into(),
         },
         ProgressEvent::Paused {
-            config_idx: 0,
             last_step: 1,
             elapsed_total: Duration::from_secs(1),
-        },
-        ProgressEvent::ConfigCompleted {
-            idx: 0,
-            candidates_processed: 1,
-            duration: Duration::from_secs(1),
-            hits: 0,
         },
         ProgressEvent::PlanCompleted {
             total_hits: 0,
@@ -197,37 +158,31 @@ fn test_progress_event_serialization() {
         assert!(!dbg.is_empty());
     }
 
-    // Bonus: StderrSink puede consumirlos sin panic.
     let out = capture_with_stderr_sink(&events);
-    assert!(out.contains("device:") && out.contains("[cfg 1/4]"));
+    assert!(out.contains("device:"));
+    assert!(out.contains("md5hex_full"));
 }
 
 #[test]
 fn test_tui_sink_does_not_panic_on_missing_nvml() {
-    // TuiSink no llama a NVML directamente — eso lo hace GpuMonitor.
-    // Simulamos NVML missing recibiendo GpuMetricsUnavailable y verificamos
-    // que el renderer lo procesa y termina limpio tras PlanCompleted.
     let mut sink = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.1.0".into(),
+        project_version: "0.2.0".into(),
     });
-
     sink.on_event(ProgressEvent::GpuMetricsUnavailable {
         reason: "Nvml::init falló: test".into(),
     });
     sink.on_event(ProgressEvent::PlanLoaded {
-        total_configs: 1,
         total_candidates: 1_000_000,
         source_sha256: "00".into(),
-        preset_name: Some("canonical".into()),
         batch_size: 1024,
         device_name: "test".into(),
+        config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
     });
     sink.on_event(ProgressEvent::PlanCompleted {
         total_hits: 0,
         elapsed_total: Duration::from_secs(0),
     });
-
     assert!(
         sink.wait_until_done(Duration::from_secs(2)),
         "renderer debería terminar tras PlanCompleted"
@@ -238,15 +193,14 @@ fn test_tui_sink_does_not_panic_on_missing_nvml() {
 fn test_tui_completes_on_plan_completed_event() {
     let mut sink = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.1.0".into(),
+        project_version: "0.2.0".into(),
     });
     sink.on_event(ProgressEvent::PlanLoaded {
-        total_configs: 1,
         total_candidates: 1_000_000,
         source_sha256: "00".into(),
-        preset_name: None,
         batch_size: 1,
         device_name: "test".into(),
+        config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
     });
     sink.on_event(ProgressEvent::PlanCompleted {
         total_hits: 0,
@@ -254,24 +208,13 @@ fn test_tui_completes_on_plan_completed_event() {
     });
     assert!(sink.wait_until_done(Duration::from_secs(2)));
 
-    // Y para el path de Paused también.
     let mut sink2 = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.1.0".into(),
+        project_version: "0.2.0".into(),
     });
     sink2.on_event(ProgressEvent::Paused {
-        config_idx: 0,
         last_step: 100,
         elapsed_total: Duration::from_secs(1),
     });
     assert!(sink2.wait_until_done(Duration::from_secs(2)));
-}
-
-/// Fixture mínimo para asegurar que el bundle cfg-typed sigue construyéndose
-/// — pillamos regresiones del `ConfigEntry` sin spawnear runner.
-#[test]
-fn test_config_entry_construction_smoke() {
-    let c = ConfigEntry::new(Kdf::Md5Utf8, IvSource::First16);
-    assert_eq!(c.kdf, Kdf::Md5Utf8);
-    assert_eq!(c.iv, IvSource::First16);
 }

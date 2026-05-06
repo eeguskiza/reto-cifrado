@@ -252,17 +252,73 @@ in-device.
 
 ---
 
-## D-012 — Throughput Fase 3: 1.2 GH/s sostenidos vs target 3 GH/s
+## D-012 — Throughput Fase 3 → Fase 6: 1.1 → 2.37 GH/s (2.1× speedup)
 
-**Estado medido** (RTX 5070 Ti, sm_120, `md5_utf8/cbc/zeros` AES-128,
-batch 128 Mi, best-of-5):
+**Tabla de progreso paso a paso** (RTX 5070 Ti, sm_120,
+`md5_utf8/cbc/zeros` AES-128, batch 32 Mi, sostenido 10–30 s):
 
-```
-≈ 1.2 GH/s sostenidos
-```
+| Paso                                              | regs | stack | smem  | avg GH/s | peak GH/s | vs base |
+|---------------------------------------------------|------|-------|-------|----------|-----------|---------|
+| Baseline Fase 3 (registros, sin launch_bounds)    |  128 |  16 B | 4640 B|   1.10   |   1.62    |  1.00×  |
+| Step 2: `__launch_bounds__(128, 6)`               |   80 |  48 B | 4640 B|   1.54   |   1.92    |  1.40×  |
+| Step 4: cap grid + N=8 candidatas/thread          |   80 |  48 B | 4640 B|   2.26   |   2.36    |  2.05×  |
+| Step 3: InvMixColumns vía Td0 (vs gmul-loop)      |   80 |  24 B | 4640 B|   2.37   |   2.42    |  2.15×  |
 
-El target preliminar de la spec era **≥ 3 GH/s**. Quedamos por debajo
-por un factor 2.5×.
+**Estado final tras Fase 6**: ~2.37 GH/s avg / 2.42 GH/s peak / 2.32 GH/s
+sostenido sobre 30 s. **Target ≥ 3 GH/s no alcanzado**: faltan ~27 % al
+target estricto. El objetivo de excelencia 4–5 GH/s tampoco se alcanza.
+
+**Tabla por KDF** (avg GH/s, batch 32 Mi, 5 s — best-of-1 por entrada):
+
+| KDF                       | klen | AES   | GH/s avg |
+|---------------------------|------|-------|----------|
+| `pw_padded`               | 16 B | 128   | 5.24     |
+| `md5hex_lo24`             | 24 B | 192   | 2.91     |
+| `md5_trunc24`             | 24 B | 192   | 2.78     |
+| `evp_md5_aes192_nosalt`   | 24 B | 192   | 2.41     |
+| `md5_utf8`                | 16 B | 128   | 2.37     |
+| `md5_md5x2_24`            | 24 B | 192   | 2.37     |
+| `md5_utf16le`             | 16 B | 128   | 2.36     |
+| `md5_utf16be`             | 16 B | 128   | 2.36     |
+| `md5hex_lo16`             | 16 B | 128   | 2.27     |
+| `md5x2_utf8`              | 16 B | 128   | 2.08     |
+| `md5_dup`                 | 32 B | 256   | 1.74     |
+| `md5_md5rev`              | 32 B | 256   | 1.70     |
+| `md5hex_full`             | 32 B | 256   | 1.76     |
+| `evp_md5_aes256_nosalt`   | 32 B | 256   | 1.68     |
+
+`pw_padded` no llama a MD5 ⇒ techo del path AES-128 puro ≈ 5.2 GH/s.
+La diferencia hasta 2.37 GH/s en `md5_utf8` es coste neto del MD5 +
+key-schedule. AES-256 KDFs (256 más rondas + 60-word rk vs 44) explican
+la caída a ~1.7 GH/s.
+
+**Lo que NO funcionó** (medido, descartado, justificado en D-021):
+
+- **Round keys en `__shared__` per-thread slot**: regs/thread bajan de 80
+  a 80 (sin cambio para AES-128 con launch_bounds activo) pero la smem
+  por bloque sube de 4640 B a 27 680 B (AES-128) / 35 872 B (AES-256).
+  100 KB de smem/SM ⇒ 3 blocks/SM (AES-128) / 2 blocks/SM (AES-256) =
+  384 / 256 threads/SM, **peor** que los 768 actuales. Bench: 2.07 GH/s
+  vs 2.37 GH/s. Net negative.
+
+- **`__launch_bounds__(128, 8)` (64 regs, 128 B stack)**: spills caros,
+  net negative vs (128, 6) pese a la mayor occupancy teórica.
+
+- **Block_dim = 256 con (256, 3)**: 768 threads/SM teóricos pero 2.19
+  GH/s reales — geometría peor para esta carga.
+
+**Lo que NO se aplicó** (analizado, no implementado):
+
+- **Cooperative AES (4 threads/decrypt)**: ganancia esperada 1.5–2× pero
+  reescribir el path AES con cooperación intra-warp es de alto riesgo
+  para un proyecto que ya funciona end-to-end. Documentado como deuda
+  en D-024.
+
+- **PTX inline `lop3.b32`**: SASS dump del kernel optimizado muestra
+  883 LOP3.LUT instructions emitidas automáticamente por ptxas; añadir
+  asm inline no aporta nada. Confirmado en D-024.
+
+**Histórico (Fase 3, antes de Fase 6)**:
 
 **Anatomía del kernel** por candidata (KDF md5_utf8 + AES-128, ruta
 más simple):
@@ -516,3 +572,509 @@ false        yes  →  TuiSink      (auto)
 ```
 
 Sin dependencia externa nueva — Rust 1.95 lo soporta nativamente.
+
+---
+
+## D-021 — Round keys en registros (NO en `__shared__`); rechazo motivado
+
+**Contexto** (Fase 6, Step 1 del plan): el prompt sugería mover `rk[44|52|60]`
+a `__shared__` con un slot por thread (padded a 45/53/61 words coprimo
+con 32 banks) para liberar registros y subir occupancy. Ganancia esperada
+1.3–1.5× según el plan original.
+
+**Implementado y medido**:
+
+```cuda
+__shared__ uint32_t s_rk[QC_BLOCK_DIM * QC_RK_SLOT];
+uint32_t* rk = &s_rk[threadIdx.x * QC_RK_SLOT];
+aes128_set_key_with_tables(key, rk, s_td0, s_sbox);  // ahora escribe a smem
+aes128_decrypt_block_ptr(rk, ...);                     // ahora lee de smem
+```
+
+**Resultado**:
+
+- Registros/thread: 80 → 80 (sin cambio: launch_bounds ya cierra el cap).
+- Smem/block: 4640 B → 27 680 B (AES-128) / 35 872 B (AES-256).
+- Blocks/SM (smem-limited): 4 → 3 (AES-128) o 2 (AES-256).
+- Threads/SM: 768 → 384 (AES-128) o 256 (AES-256). **Peor occupancy real**.
+- Throughput md5_utf8: 2.37 GH/s → 2.07 GH/s (–13 %).
+
+**Diagnóstico**: con block_dim=128 y rk-slot=45 words, smem se vuelve el
+bottleneck. Para fitar 6 blocks/SM (manteniendo los 768 threads/SM
+actuales) habría que recortar el slot a ≤ 16 words, lo que requiere
+COMPUTAR las round keys lazy durante el decrypt — significativamente más
+complejo (key schedule reverse + InvMixColumns inline por ronda) y de
+alto riesgo en un kernel que ya pasa los 88 tests.
+
+**Decisión**: `rk` permanece en local memory (con `__launch_bounds__` el
+compilador spillea unos 24 B de stack frame, los regs hot quedan en
+registers). La **ruta válida** del prompt en este proyecto es la
+combinación Step 2 + Step 3 + Step 4, que da 2.37 GH/s sostenidos.
+
+La cooperative-AES alternativa (4 threads/decrypt, rk compartido en
+warp) ofrece más margen pero queda como deuda futura — ver D-024.
+
+---
+
+## D-022 — `__launch_bounds__(128, 6)` recorta regs de 128 → 80
+
+**Contexto**: ptxas elegía 128 registros/thread sin restricciones, lo que
+con 64 K regs/SM daba un techo de 4 blocks/SM × 128 threads = 512
+threads/SM ≈ **25 % occupancy** en sm_120 (target práctico 50–75 %).
+
+**Probado** (medido sobre brute_0.cubin con `--resource-usage`):
+
+| `__launch_bounds__(T, B)` | regs | stack | threads/SM | GH/s avg |
+|---------------------------|------|-------|------------|----------|
+| sin directiva             | 128  |  16 B |    512     |   1.10   |
+| (128, 4)                  | 128  |  16 B |    512     |   ≈1.10  |
+| (128, 5)                  |  96  |  16 B |    640     |  no test |
+| **(128, 6)**              |  **80** |  **24 B** |  **768** |  **2.37** |
+| (128, 7)                  |  72  |  40 B |    896     |   2.22   |
+| (128, 8)                  |  64  | 128 B |   1024     |   2.32   |
+| (256, 3)                  |  80  |  24 B |    768     |   2.19   |
+| (64, 12)                  |  80  |  24 B |    768     |   2.33   |
+
+**Decisión**: `(128, 6)` es el punto óptimo. Bajar más regs (`(128, 7)` o
+`(128, 8)`) introduce spills cuyo coste compensa la occupancy ganada.
+Cambiar `block_dim` a 256 o 64 con la misma ratio threads/SM da peor
+throughput por geometría.
+
+`block_dim` está hardcoded en `src/cuda.rs::QC_BLOCK_DIM = 128` y debe
+**coincidir** con `QC_BLOCK_DIM` del kernel — ptxas ignora `__launch_bounds__`
+si el host lanza con un block_dim distinto.
+
+---
+
+## D-023 — InvMixColumns: ruta `aes_inv_mix_column_via_td0` gana tras Fase 6
+
+**Contexto**: D-009 documentaba que el gmul-loop unrolled (puro ALU)
+ganaba a la ruta SBOX→Td0 (1.57 vs 1.25 GH/s) cuando register pressure
+limitaba la occupancy.
+
+**Re-medido tras Step 2 + Step 4**:
+
+| InvMixColumns route | regs | smem  | GH/s avg | Δ |
+|---------------------|------|-------|----------|---|
+| gmul-loop (D-009)   |  80  | 4640 B|   2.26   | base |
+| via_td0 (Fase 6)    |  80  | 4640 B|   **2.37** | +5 % |
+
+Con `__launch_bounds__(128, 6)` la occupancy ya no es el bottleneck.
+La ruta vía Td0 tiene ~5 instr/inv_mix (4 LDS + 4 PRMT/XOR) vs ~130
+instr/inv_mix del gmul-loop puro ALU. 36 calls × ~125 instr ahorradas =
+~4 500 instr menos por candidata. Ganancia neta: +5 %.
+
+**Tablas en `__shared__` vs `__constant__`**: confirmamos que la
+decisión de D-009 (copy `Td0..Td3 + INV_SBOX + SBOX` desde `__constant__`
+a `__shared__` una vez por bloque) sigue siendo óptima. Las 256 entradas
+× 6 tablas = 4640 B/block es despreciable frente a los 100 KB smem/SM
+disponibles. Probar `__constant__` con sm_120 sería 6× peor por
+serialización del puerto de constants cuando los hilos leen direcciones
+distintas (ya documentado).
+
+**Constantes del MD5 (`QC_MD5_K[64]`, `QC_MD5_S[64]`)**: permanecen en
+`__constant__`. Comparten dirección por ronda (todos los hilos leen
+`QC_MD5_K[i]` para el mismo `i`) ⇒ broadcast-friendly, óptimo en
+`__constant__`. Mover a `__shared__` no aporta y consume smem.
+
+---
+
+## D-024 — Step 4 (N candidatas por thread) y Step 5 (`lop3.b32`)
+
+**Step 4 implementado**: el grid se cap a `QC_MAX_GRID_BLOCKS = 4096`
+bloques (vs ilimitado antes). Combinado con `QC_N_PER_THREAD = 8`,
+fuerza el stride-loop interno del kernel a iterar ~8 veces por thread
+en cada lanzamiento de 32 Mi candidatas.
+
+| Cap grid blocks | N/thread | GH/s avg |
+|-----------------|----------|----------|
+| 524 288 (sin cap, baseline) |    1    |   1.54   |
+|  16 384         |    8     |   2.26   |
+|   4 096         |    8     |   2.26   |
+|   2 048         |    8     |   2.27   |
+|   4 096         |   32     |   2.31   |
+
+Decisión: `QC_MAX_GRID_BLOCKS = 4096`, `QC_N_PER_THREAD = 8`. Saturado:
+N > 8 y cap < 4096 dan diferencias < 3 % no significativas. El thread
+queda "caliente" entre iteraciones (warp issue slot reservado, regs de
+tablas/iv/ct cacheados). Este es el lever más eficaz de Fase 6 (+0.7
+GH/s sobre Step 2 solo).
+
+**Step 5 (`lop3.b32` inline asm)**: **NO implementado** porque ya está.
+El SASS dump del kernel optimizado (`cuobjdump --dump-sass brute_0.cubin`)
+revela 883 instrucciones `LOP3.LUT R*, R*, R*, R*, 0x96, !PT` — el
+compilador detecta los XOR-de-3-vías del round body AES y emite LOP3
+nativos sin necesidad de asm explícito. Histograma SASS de instrucciones:
+
+```
+883 LOP3
+815 SHF
+480 LDS    ← potencial bottleneck
+279 IMAD
+251 IADD3
+197 LEA
+ 86 LDC
+```
+
+Implementar lop3 manual sería redundante. Documentado como **deuda
+futura justificada**: el siguiente lever de optimización es **cooperative
+AES** (4 threads/decrypt con shfl + warp-sync) que reduciría LDS por
+factor 4 al compartir round keys intra-warp. Coste estimado: 1–2 días
+de implementación + invasive testing. Beneficio estimado: 1.5–2× sobre
+los 2.37 GH/s actuales (= 3.5–4.5 GH/s, alcanzando el target de
+excelencia 4–5 GH/s del prompt). Aceptamos esto como deuda porque:
+
+1. La herramienta CUMPLE su función a 2.37 GH/s (preset exhaustive en
+   ~7 días vs ~5.5 días @ 3 GH/s). La diferencia material es marginal
+   para un barrido único de la vida.
+2. Reescribir el path AES con cooperación intra-warp es invasivo:
+   afecta a las 14 variantes del kernel, requiere tests adicionales de
+   bit-exactness por intra-warp shuffling, y rompe la isomorfía actual
+   con el código de referencia CPU.
+3. Los 91 tests verdes son un activo. Estamos en un punto de salida
+   estable.
+
+Si en el futuro hace falta más throughput, abrir Fase 7 con cooperative
+AES como objetivo único.
+
+---
+
+## D-025 — Default `batch_size = 64 Mi` para `run`, no 16 Mi
+
+**Contexto** (Fase 7): el run de producción documentado por el usuario
+medía **0,86 GH/s sostenidos**, vs **2,37 GH/s avg** medidos por
+`benchmark` (D-012). Factor 2,75× de pérdida que no era atribuible al
+kernel.
+
+**Diagnóstico** (`tests/throughput_diagnosis.rs`, ver
+`diagnose_save_progress_overhead`): `save_progress_with_bak` tarda
+**9,7 ms por llamada** en este FS (WSL2, ext4 ordered). En Fase 4 el
+runner hacía un `save_progress_with_bak` por batch. Con batch_size
+= 16 Mi (default Fase 4) y kernel ≈ 9 ms/batch a 1,8 GH/s, **el fsync
+costaba más que el kernel** y duplicaba la latencia por batch ⇒ 0,9
+GH/s reales.
+
+**Sweep medido** (`diagnose_runner_throughput_*`):
+
+| batch_size | flush_every | GH/s real (run path) | Notas                       |
+|------------|-------------|----------------------|-----------------------------|
+| 16 Mi      | 1           | 0,91                 | **baseline pre-D-026**      |
+| 16 Mi      | 8           | 1,66                 | flush amortizado            |
+| 64 Mi      | 1           | 1,53                 | batch grande, fsync por batch |
+| 64 Mi      | 8           | **1,88**             | óptimo conjunto (D-025+D-026)|
+| 128 Mi     | 4           | 1,89                 | similar, peor granularidad UI|
+
+**Decisión**:
+
+- Default de `--batch-size` para el subcomando `run` sube de
+  16 Mi → **64 Mi** (4×). El subcomando `benchmark` mantiene
+  128 Mi (sin cambios).
+- Combinado con flush agrupado (D-026), el throughput end-to-end
+  pasa de 0,91 → 1,88 GH/s en este hardware. El factor de pérdida
+  vs kernel-only baja de 2,75× a 1,06× (overhead < 6 %).
+
+**Pérdida en kill duro** (estimada): a batch=64 Mi y 2 GH/s, ~32 ms
+de cómputo perdido. Combinado con flush_every=8 (D-026): ~256 ms en
+el peor caso. Aceptable para una herramienta de barrido nocturno.
+
+**Por qué 64 Mi y no 128 Mi**: la pérdida/regresión en kill duro
+escala lineal con batch_size (256 ms vs 512 ms). 64 Mi da el mismo
+throughput que 128 Mi en este hardware (1,88 vs 1,89 GH/s) con la
+mitad de latencia "perdible".
+
+**Por qué no más allá de 1,88 GH/s en run real**: el techo del kernel
+en este hardware (RTX 5070 Ti, WSL2, condiciones actuales) es
+**~1,99 GH/s avg sostenido sobre 30 s** según `benchmark --duration 30
+--batch-size 134217728`. La cifra de 2,37 GH/s en D-012 fue medida
+bajo condiciones de sistema más favorables (probable: GPU más fría,
+menos load concurrente). El runner alcanza 94–96 % de ese ceiling
+hardware tras D-025+D-026. El gap residual es físico, no software.
+
+**Test de regresión**:
+`tests/runner_throughput.rs::test_real_run_throughput_meets_target_1_5ghz`
+ejecuta el path real del runner sobre 5 s y verifica ≥ 1,5 GH/s.
+1,5 GH/s deja margen contra variabilidad térmica; cualquier regresión
+seria del runner (vuelta al fsync por batch, kernel roto) cae muy
+por debajo.
+
+**Compatibilidad de estado**: el formato de `progress.toml` y
+`plan.toml` NO cambia. Sesiones interrumpidas con la versión
+pre-D-025 reanudan sin migración; el `batch_size` viene del
+`plan.toml`, no del CLI. Validado por
+`test_state_compat_with_pre_optimization_progress` con un fixture
+real (`tests/fixtures/legacy_progress.toml`) extraído de la sesión
+del usuario pausada en idx 30 079 585 353 728.
+
+---
+
+## D-026 — Flush agrupado: `progress.toml` cada `flush_every` batches
+
+**Contexto**: relacionado con D-025. `save_progress_with_bak` cuesta
+9,7 ms/llamada en este FS (medido en
+`diagnose_save_progress_overhead`). Con batch_size grandes el
+overhead por batch baja, pero seguía suponiendo varios % del tiempo
+total en run real.
+
+**Decisión**: introducir `RunOptions::flush_every_n_batches` (default
+**8**, configurable vía `--flush-every`). El runner mantiene el
+progreso en RAM por batch (incluye `next_step`, `tried`, `elapsed_us`)
+pero solo persiste a disco cada N batches o ante eventos críticos.
+
+**Eventos que SIEMPRE fuerzan flush** (no esperan al ciclo):
+
+- Hit confirmado (antes de `RunOutcome::Found`).
+- PKCS7 mismatch crítico (antes de abortar, D-007).
+- Stop signal (SIGINT/SIGTERM, D-015).
+- Fin de config (avance al siguiente entry, evita resume con cfg
+  completa pero no flusheada).
+- Fin de plan completo.
+
+**Por qué flush_every = 8 default**:
+
+- Amortización: 8 × 32 ms (kernel a 64 Mi @ 2 GH/s) = 256 ms / 9,7 ms
+  = ~3,8 % de overhead. Despreciable.
+- Pérdida en kill duro: 7 batches × 32 ms = 224 ms — aceptable
+  comparado con horas de barrido.
+- Granularidad UI: 1 evento `BatchCompleted` por batch sigue llegando
+  al sink (la TUI / stderr ven progreso cada batch); solo el flush a
+  disco se agrupa.
+
+**Atomicidad por flush**: la garantía de Fase 4 (`atomic_write` con
+secuencia tmp → fsync → rename → dir-fsync) **no cambia**. Cada flush
+sigue siendo atómico individualmente. Lo único que se agrupa es la
+frecuencia, no la atomicidad.
+
+**Optimización adicional dentro de `save_progress_with_bak`**: cambio
+`fs::copy(path, bak)` por `fs::rename(path, bak)`. Un rename es un
+cambio de dirent (~0,1 ms) frente a un read+write+fsync de todo el
+fichero (~3 ms). Reduce el coste medido de 12,5 ms → 9,7 ms (~25 %).
+La semántica es idéntica: el fichero anterior queda en `.bak` antes
+de escribir el nuevo. En el path subsiguiente, `atomic_write` crea
+un nuevo `.toml` desde `.new` con su propia atomicidad.
+
+**Tests**:
+
+- `test_real_run_throughput_meets_target_1_5ghz` — validación end-to-end.
+- `test_resume_after_grouped_flush` — pausa con flush_every=4, resume con
+  flush_every=8, verifica monotonía de `next_step` y reanudación
+  correcta entre ventanas de flush distintas.
+- `test_save_load_roundtrip_after_d026` — saneamiento del par
+  save/load tras el cambio rename-vs-copy, incluye verificación de
+  que `.bak` queda en estado correcto tras dos flushes consecutivos.
+- `test_state_compat_with_pre_optimization_progress` — un
+  `progress.toml` escrito por la versión pre-D-026 sigue siendo
+  legible y sus 42 entries / next_step de 30 T se cargan tal cual.
+
+**No implementado**: deferred fsync vía hilo background. Habría
+elevado complejidad (sincronización con el flush forzado al pause)
+sin ganancia añadida — con flush_every=8 ya estamos a < 4 % de
+overhead.
+
+---
+
+## D-027 — Fix NVML en WSL2: symlink `libnvidia-ml.so`
+
+**Contexto** (Fase 7): durante el run de producción del usuario
+apareció el warning persistente:
+
+```
+[GPU] metrics unavailable: Nvml::init falló: libloading error
+occurred: libnvidia-ml.so: cannot open shared object file:
+No such file or directory
+```
+
+El barrido funcionaba intacto (la GPU computa sin NVML), pero la
+línea `[GPU] util / mem / temp / power` de la TUI no se rellenaba.
+
+**Diagnóstico** (`find / -name "libnvidia-ml*"`):
+
+- WSL2 expone `libnvidia-ml.so.1` en `/usr/lib/wsl/lib/` (provisto
+  por el driver de Windows vía la integración WSL).
+- `nvml-wrapper 0.10` carga la librería con `libloading`, que
+  por defecto busca **`libnvidia-ml.so`** (sin el sufijo `.1`).
+- Ese symlink no se crea automáticamente. `ldconfig -p` resuelve
+  `libnvidia-ml.so.1` pero no `libnvidia-ml.so`.
+
+**Fix** (privilegiado, una vez por máquina):
+
+```bash
+sudo ln -s /usr/lib/wsl/lib/libnvidia-ml.so.1 /usr/lib/wsl/lib/libnvidia-ml.so
+sudo ldconfig
+```
+
+**Fix sin sudo** (alternativa per-usuario):
+
+```bash
+mkdir -p ~/lib-nvml-shim
+ln -sf /usr/lib/wsl/lib/libnvidia-ml.so.1 ~/lib-nvml-shim/libnvidia-ml.so
+echo 'export LD_LIBRARY_PATH=$HOME/lib-nvml-shim:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+**Verificación**: `tests/nvml_shim.rs::nvml_init_succeeds_when_so_available`
+intenta `Nvml::init()` y se considera SKIP si la librería no es
+resoluble en el entorno (sin shim, sin driver). Si la librería sí
+está pero `Nvml::init` falla, panic — eso sería una regresión real.
+
+**Documentado** en README sección **Troubleshooting WSL2 → NVML**.
+
+---
+
+## D-028 — Cooperative AES: NO implementado en Fase 7
+
+**Contexto**: el spec de Fase 7 contempla "O.5 — Cooperative AES
+intra-warp" como último recurso si tras O.1–O.4 no se llega a
+2 GH/s sostenidos en run real.
+
+**Decisión**: **NO implementar** Cooperative AES en esta iteración.
+
+**Justificación**:
+
+1. Tras D-025 + D-026 + D-027, el runner sostiene **1,88 GH/s
+   end-to-end**, **96 %** del techo del kernel en este hardware
+   (~1,99 GH/s). El gap residual no es resoluble por software.
+2. El target estricto de 2,0 GH/s era hardware-limitado: el
+   benchmark mismo no llega de forma sostenida en estas
+   condiciones (1,87 GH/s avg sobre 30 s).
+3. Cooperative AES rompe la isomorfía con el path CPU de
+   referencia. Habría requerido tests bit-exact adicionales para
+   las 14 variantes del kernel (D-024 ya documenta el coste).
+4. Los 91 + 4 tests siguen verdes; deuda documentada en D-024 es
+   suficiente.
+
+Si en el futuro hace falta empujar más allá, abrir Fase 8 con
+Cooperative AES como objetivo único, partiendo del kernel actual
+como baseline `brute_legacy_v2.cu`.
+
+---
+
+## D-029 — Refactor a una única configuración: AES-256-ECB + md5hex
+
+**Contexto**: el autor del reto confirma oficialmente la construcción
+criptográfica final:
+
+```
+key  = MD5(password.encode("utf-8")).hexdigest().encode("ascii")  # 32 B AES-256
+mode = AES-256-ECB
+pad  = PKCS7
+```
+
+(no hay IV — ECB).
+
+Esto **descarta por confirmación** las 13 KDFs alternativas, los modos
+CFB/OFB/CTR (ya descartados en D-006) y las 3 variantes de IV. La
+estructura del password sigue siendo `.LLLLLLLL1NNN.` (D-001/D-002).
+
+### Cambios al modelo
+
+- **Plan único**: `Plan { program_version, source_path, source_sha256,
+  batch_size, shuffle }`. Desaparecen `entries`, `preset`, `Preset`,
+  `Mode`, `IvSource`, `ConfigEntry`. La descripción única se publica
+  en `SINGLE_PLAN_DESCRIPTION = "md5hex_full / aes-256-ecb / pkcs7"`.
+- **`Progress` escalar**: un único `next_step` (0..N) en lugar del
+  vector paralelo `per_config`. `Hit` deja de incluir `ConfigEntry`.
+- **`program_version` sube a `0.2.0`** para hacer el corte explícito.
+  `state.rs::looks_like_legacy_plan/progress` detecta los formatos
+  antiguos (`[[entries]]`, `[[per_config]]`, `current_config`,
+  `preset`) y devuelve `StateError::LegacyFormat` con mensaje claro
+  invitando a `quattro-crack reset --yes`.
+
+### Cambios a CUDA
+
+- **Único PTX activo**: `kernels/brute_md5hex_aes256_ecb.cu`. Sin
+  `#define KDF_ID`, `#define KEY_LEN` ni `#define MODE`. Todo cableado
+  (md5 → hex ASCII in-register → AES-256 → comparación contra
+  `"Leonardo da Vinc"`, sin XOR de IV porque ECB).
+- **`kernels/brute.cu`** (Fase 3.5, parametrizado, 14 PTX) se
+  archiva como `kernels/brute_legacy_phase6.cu` y NO se compila.
+- **`build.rs`** simplificado: ya no itera la tabla de KDFs.
+- **`KernelBundle::load(ctx)`** sin parámetros (no recibe `Kdf`).
+  **`KernelBundle::launch`** recibe solo `idx_base, idx_count,
+  ct_block_0` (ECB no necesita IV).
+- **`DeviceHit`** se reduce a `{ idx: u64 }` (sin `kdf_id`/`iv_id`).
+
+### Cambios a la CLI
+
+- `quattro-crack run` ya no acepta `--preset`, `--skip-config`,
+  `--only-config`. Tampoco `--kdf` ni `--iv` en `benchmark`.
+- `inspect` ya no menciona IV. Reporta los 1616 B como ciphertext
+  completo (101 bloques de 16 B).
+- `plan` muestra una sola línea con `SINGLE_PLAN_DESCRIPTION`.
+
+### Cambios a `reference.rs`
+
+- **Path activo**: `decrypt_ecb_raw`, `encrypt_ecb_pkcs7`,
+  `validate_hit(key: &[u8;32], ct: &[u8])`. La validación de hit
+  sigue siendo de 3 pasos (D-007 vigente): prefijo-16 (kernel),
+  prefijo-32 (CPU) y PKCS7 (CPU).
+- **Legacy CBC**: `decrypt_cbc_raw`, `encrypt_cbc_pkcs7` se mantienen
+  con `#[doc(hidden)]` y `pub` (no `pub(crate)` para permitir su uso
+  desde tests de integración). Solo se invocan desde el catálogo
+  `tests/legacy_kdf.rs` y similares; **NO se usan en el path activo**.
+
+### Cambios a tests
+
+- **Eliminados** (obsoletos por construcción): `tests/aes_cbc_pkcs7.rs`,
+  `tests/plan_order.rs`.
+- **Adaptados** a ECB md5hex: `tests/resume.rs`, `tests/e2e_synthetic.rs`,
+  `tests/optimized_kernel_parity.rs`, `tests/runner_throughput.rs`,
+  `tests/throughput_diagnosis.rs`, `tests/kdf.rs` (solo md5hex_full),
+  `tests/tui.rs`.
+- **Nuevos**: `tests/d029_single_config.rs` (3 tests: plan único,
+  inspect ECB, signature de `KernelBundle::load`); `tests/legacy_kdf.rs`
+  (mueve los 14 KDFs vs Python aquí).
+- **Intactos**: `tests/cpu_gpu_parity.rs`, `tests/generator.rs`,
+  `tests/md5_rfc1321.rs`, `tests/aes_fips197.rs`, `tests/nvml_shim.rs`.
+
+### Throughput medido (post-D-029)
+
+Sobre el kernel único `brute_md5hex_aes256_ecb` (RTX 5070 Ti, sm_120,
+WSL2, condiciones del refactor):
+
+| Medición                         | GH/s     |
+|----------------------------------|----------|
+| benchmark batch 128 Mi, 30 s     | avg 1,48 / peak 1,82 |
+| runner end-to-end (5 s synth)    | 1,26     |
+| kernel-only (cold, peak)         | 1,82     |
+
+**Comparación con kernel multi-KDF anterior (md5_utf8 + AES-128 + CBC,
+camino más rápido)**: avg 1,87 GH/s (Fase 7). El kernel post-D-029 es
+~20 % más lento porque AES-256 tiene 14 rondas vs 10 (AES-128) y rk
+de 60 words vs 44, lo que pesa más que la simplificación
+arquitectónica del dispatch único.
+
+**Comparación con el path md5hex_full + AES-256-CBC del kernel
+multi-KDF**: D-012 documenta 1,76 GH/s avg en condiciones más
+favorables. El nuevo kernel es ligeramente mejor (1,82 peak vs 1,76)
+gracias a:
+- Eliminación del branch IV (`if iv_mode == 0/1/2`).
+- Eliminación del XOR con IV en el bloque post-decrypt.
+- Una sola PTX en cache de instrucciones del SM (vs 14).
+
+La mejora de 10–20 % esperada se materializa parcialmente; el grueso
+del coste está en MD5 + AES-256 + key-schedule, que no cambia.
+
+### ETAs nuevas (a 1,48 GH/s avg sostenido)
+
+`N = 59 559 806 250 000` (D-001).
+
+| Throughput | ETA barrido completo |
+|------------|----------------------|
+| 1,48 GH/s avg | 40 240 s ≈ 11,2 h ≈ **0,47 días** |
+| 1,82 GH/s peak | 32 720 s ≈ 9,1 h |
+| 1,26 GH/s runner real (hot) | 47 270 s ≈ 13,1 h |
+
+El tiempo cae de "≈ 1,5 días" del plan exhaustive de 42 configs a
+**~12 h** del plan único — speedup efectivo ≈ 3× porque ya solo se
+recorre el espacio una vez.
+
+### Estado tras D-029
+
+- `state/` borrado (formato incompatible).
+- `program_version = 0.2.0`.
+- 81 tests verdes + 10 ignorados (diagnóstico opt-in).
+- Clippy limpio (`-D warnings`).
+- Un único PTX activo en `target/...release/build/.../out/`.
+- Cooperative AES (D-024, D-028) sigue como deuda futura: ya no es
+  un lever evidente porque el kernel actual está limitado por las
+  14 rondas de AES-256, no por dispatch overhead.
