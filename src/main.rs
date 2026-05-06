@@ -15,7 +15,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, TOTAL_BIN_LEN};
 use quattro_crack::combinatorics::N as N_TOTAL;
-use quattro_crack::cuda::{CudaCtx, KernelBundle};
+use quattro_crack::cuda::{CudaCtx, KernelBundle, KernelBundleCoop};
 use quattro_crack::gpu_metrics::GpuMonitor;
 use quattro_crack::plan::{Plan, PLAN_FORMAT_VERSION, SINGLE_PLAN_DESCRIPTION};
 use quattro_crack::runner::{self, ProgressSink, RunOptions, RunOutcome, StderrSink};
@@ -120,6 +120,10 @@ enum Cmd {
         /// Tamaño de cada batch lanzado al kernel.
         #[arg(long, default_value_t = 128 * 1024 * 1024)]
         batch_size: u64,
+
+        /// Usar el kernel COOPERATIVO intra-warp (D-030) en vez del legacy.
+        #[arg(long, default_value_t = false)]
+        coop: bool,
     },
 }
 
@@ -155,7 +159,11 @@ fn main() -> Result<()> {
             &log_dir,
         ),
         Cmd::Reset { state_dir, yes } => reset_cmd(&state_dir, yes),
-        Cmd::Benchmark { duration, batch_size } => benchmark_cmd(duration, batch_size),
+        Cmd::Benchmark {
+            duration,
+            batch_size,
+            coop,
+        } => benchmark_cmd(duration, batch_size, coop),
     }
 }
 
@@ -357,21 +365,48 @@ fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn benchmark_cmd(duration_secs: u64, batch_size: u64) -> Result<()> {
+fn benchmark_cmd(duration_secs: u64, batch_size: u64, coop: bool) -> Result<()> {
     let ctx = CudaCtx::init().context("CUDA init")?;
     let device = ctx.device_name().unwrap_or_else(|_| "<unknown>".into());
-    let mut bundle = KernelBundle::load(&ctx).context("cargando kernel")?;
+
+    // Selección de kernel: D-030 cooperativo o legacy. La elección se
+    // resuelve con un enum interno para que el resto del código quede
+    // genérico sobre la API `launch(idx_base, idx_count, ct_block_0)`.
+    enum Bundle {
+        Legacy(KernelBundle),
+        Coop(KernelBundleCoop),
+    }
+    impl Bundle {
+        fn launch(&mut self, ib: u64, ic: u64, ct: &[u8; 16]) -> Result<()> {
+            match self {
+                Bundle::Legacy(b) => {
+                    b.launch(ib, ic, ct)?;
+                }
+                Bundle::Coop(b) => {
+                    b.launch(ib, ic, ct)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let mut bundle = if coop {
+        Bundle::Coop(KernelBundleCoop::load(&ctx).context("cargando kernel coop D-030")?)
+    } else {
+        Bundle::Legacy(KernelBundle::load(&ctx).context("cargando kernel legacy")?)
+    };
 
     // CT block aleatorio improbable de matchear "Leonardo da Vinc".
     let ct_block_0 = [0xffu8; 16];
 
     println!("device       : {device}");
+    println!("kernel       : {}", if coop { "D-030 cooperative intra-warp" } else { "legacy single-thread" });
     println!("config       : {SINGLE_PLAN_DESCRIPTION}");
     println!("batch size   : {batch_size} ({:.2} Mi)", batch_size as f64 / (1u64 << 20) as f64);
     println!("duration tgt : {duration_secs}s");
     println!();
 
-    let _ = bundle
+    bundle
         .launch(0, batch_size.min(16 * 1024 * 1024), &ct_block_0)
         .context("warmup launch")?;
 
@@ -385,7 +420,7 @@ fn benchmark_cmd(duration_secs: u64, batch_size: u64) -> Result<()> {
     let mut idx_base: u64 = 0;
     while started.elapsed() < total_target {
         let t0 = std::time::Instant::now();
-        let _ = bundle
+        bundle
             .launch(idx_base, batch_size, &ct_block_0)
             .context("benchmark launch")?;
         let dt = t0.elapsed();

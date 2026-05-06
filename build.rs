@@ -21,9 +21,10 @@ const SHARED_HEADERS: &[&str] = &[
     "kernels/md5.cuh",
     "kernels/aes.cuh",
     "kernels/aes_tables.cuh",
+    "kernels/aes_coop.cuh",
 ];
 
-/// Sources que producen PTX activos (D-029).
+/// Sources que producen PTX activos (D-029 + D-030).
 const KERNEL_SOURCES: &[&str] = &[
     "kernels/dump_passwords.cu",
     "kernels/md5_test.cu",
@@ -31,6 +32,8 @@ const KERNEL_SOURCES: &[&str] = &[
     "kernels/force_emit_hits.cu",
     "kernels/dump_pt_block0.cu",
     "kernels/brute_md5hex_aes256_ecb.cu",
+    "kernels/brute_md5hex_aes256_ecb_coop.cu",
+    "kernels/dump_pt_block0_coop.cu",
 ];
 
 fn main() -> Result<()> {
@@ -108,7 +111,7 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // ÚNICO PTX activo del barrido (D-029).
+    // PTX activo legacy del barrido (D-029).
     let brute_src = Path::new("kernels/brute_md5hex_aes256_ecb.cu");
     if !brute_src.exists() {
         bail!(
@@ -124,6 +127,34 @@ fn main() -> Result<()> {
         &profile,
     )
     .context("compilando brute_md5hex_aes256_ecb.cu")?;
+
+    // PTX cooperativo intra-warp (D-030).
+    let brute_coop_src = Path::new("kernels/brute_md5hex_aes256_ecb_coop.cu");
+    if brute_coop_src.exists() {
+        compile_ptx(
+            &nvcc,
+            &arch,
+            brute_coop_src,
+            &[],
+            &out_dir.join("brute_md5hex_aes256_ecb_coop.ptx"),
+            &profile,
+        )
+        .context("compilando brute_md5hex_aes256_ecb_coop.cu")?;
+    }
+
+    // PTX dump cooperativo (paridad bit-exact a 1M idx).
+    let dump_coop_src = Path::new("kernels/dump_pt_block0_coop.cu");
+    if dump_coop_src.exists() {
+        compile_ptx(
+            &nvcc,
+            &arch,
+            dump_coop_src,
+            &[],
+            &out_dir.join("dump_pt_block0_coop.ptx"),
+            &profile,
+        )
+        .context("compilando dump_pt_block0_coop.cu")?;
+    }
 
     Ok(())
 }
