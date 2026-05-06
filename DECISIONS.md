@@ -1078,3 +1078,308 @@ recorre el espacio una vez.
 - Cooperative AES (D-024, D-028) sigue como deuda futura: ya no es
   un lever evidente porque el kernel actual está limitado por las
   14 rondas de AES-256, no por dispatch overhead.
+
+## D-030 — Cooperative AES intra-warp implementado, descartado por throughput
+
+**Contexto**: la deuda heredada de D-024 / D-028 sugería que cooperative
+AES intra-warp era el lever pendiente para subir el throughput sostenido
+del barrido más allá de 1,5 GH/s. El kernel legacy (post-D-029) tenía
+80 regs/thread + 84 B de spill stores, lo que en papel apuntaba a que
+mover `rk[60]` fuera de registros (a `__shared__`) liberaría regs y
+subiría occupancy.
+
+### Implementación
+
+Se escribió `kernels/brute_md5hex_aes256_ecb_coop.cu` con el modelo:
+
+- 4 threads cooperan sobre 1 candidata (column-decomposition de 32 bits).
+- 8 grupos por warp → 8 candidatas/warp (vs 32/warp en legacy).
+- 4 warps/block, 32 grupos/block, 32 candidatas/block/iter.
+- Leader (`lane%4 == 0`) hace KDF (MD5+hexify) + AES-256 key schedule,
+  escribe `rk[60]` directamente en `__shared__` (slot por grupo).
+- Followers (`lane%4 ∈ {1,2,3}`) cargan su columna de `rk` (15 dwords)
+  en registros tras `__syncwarp`.
+- Decrypt cooperativo: `__shfl_sync(width=4)` para InvShiftRows entre
+  los 4 threads del grupo; T-tables Td0..Td3 + INV_SBOX en `__shared__`.
+- Comparación de prefijo via `__ballot_sync` con máscara de 4 bits
+  por grupo. Líder emite hit con `atomicAdd`.
+
+Helper `aes256_decrypt_block_coop` factorizado en `kernels/aes_coop.cuh`
+y reutilizado por `dump_pt_block0_coop.cu` (kernel paralelo de
+diagnóstico para tests).
+
+### ptxas medido (sm_120, -O3, --use_fast_math)
+
+| `__launch_bounds__` | regs/thread | stack | spill stores | smem/block |
+|---------------------|-------------|-------|--------------|------------|
+| (128, 4)            | 112         | 16 B  | 0 B          | 12 304 B   |
+| (128, 5) ★          | 96          | 16 B  | 0 B          | 12 304 B   |
+| (128, 6)            | 80          | 88 B  | 76 B         | 12 304 B   |
+| (128, 7)            | 72          | 120 B | 112 B        | 12 304 B   |
+| (128, 8)            | 64          | 152 B | 144 B        | 12 304 B   |
+
+★ Configuración elegida: 96 regs, 0 spill, 20 warps/SM (41,7 % occupancy
+nominal, limitado por shared mem total ≈ 100 KB / 12 304 B ≈ 8 blocks/SM
+máximo, pero con (128,5) se garantiza 0 spill).
+
+### Validación bit-exact (5 tests bloqueantes)
+
+`tests/coop_kernel_parity.rs`, **todos verdes**:
+
+1. `test_coop_dump_matches_reference_1m` — 1 000 000 idx (5 chunks de
+   200 K en posiciones diversas del espacio incl. origen y N−1)
+   contra `reference::decrypt_ecb_raw`. **0 discrepancias**.
+2. `test_coop_dump_matches_legacy_dump_1m` — 1 000 000 idx contra el
+   `dump_pt_block0` legacy (10 chunks random de 100 K). **0 bytes
+   distintos**.
+3. `test_coop_brute_finds_synthetic_hit` — clave conocida
+   `.lEonardo1452.` recuperada por el kernel cooperativo.
+4. `test_coop_brute_matches_legacy_on_synthetic` — legacy y coop
+   reportan exactamente el mismo set de hits sobre el mismo CT.
+5. `test_coop_brute_no_false_positives_1m` — CT pseudo-aleatorio,
+   1 M idx, **cero hits** espurios.
+
+### Throughput medido (RTX 5070 Ti, sm_120, batch 128 Mi)
+
+| Kernel        | duración | avg GH/s | peak GH/s | median GH/s |
+|---------------|----------|----------|-----------|-------------|
+| legacy D-029  |   30 s   | **1,502**| 1,824     | 1,430       |
+| legacy D-029  |   60 s   | **1,486**| 1,821     | 1,417       |
+| **coop D-030**|   30 s   | **0,817**| 0,994     | 0,782       |
+| **coop D-030**|   60 s   | **0,814**| 0,991     | 0,776       |
+
+**Cooperativo entrega 54,8 % del throughput de legacy → regresión del
+45 %.** No se promociona a kernel activo.
+
+### Por qué pierde — análisis matemático (modelo Amdahl per-warp)
+
+Coste por candidata aproximado:
+
+```
+T_kdf  ≈ 880 ops   (MD5(14 B) unrolled + hexify in-register)
+T_ks   ≈ 700 ops   (AES-256 key schedule + InvMixColumns rk[4..56])
+T_dec  ≈ 550 ops   (AES-256 decrypt nominal sin spill)
+T_dec_coop ≈ 200 ops por warp (cooperative decrypt amortiza 4×)
+T_dec_legacy_with_spill ≈ 1 000 ops por thread (con 84 B spill)
+```
+
+Per-warp throughput:
+
+- **Legacy**: 32 candidatas / (T_kdf + T_ks + T_dec_legacy)
+              = 32 / (880 + 700 + 1 000) = **0,012 cand/op**
+- **Coop**:    8 candidatas / (T_kdf + T_ks + T_dec_coop)
+              = 8 / (880 + 700 + 200) = **0,0045 cand/op**
+
+Ratio per-warp = 0,38 — **el cooperativo es 2,6× más lento por warp
+que el legacy**. Para compensar harían falta 2,6× más warps activos
+por SM, pero la occupancy real solo sube de 24 a 20 warps/SM (de
+hecho **baja** porque los launch_bounds para evitar spill exigen 5
+blocks/SM × 4 warps = 20 warps).
+
+Ratio SM = (20/24) × 0,38 = **0,32**. La medición empírica (0,55) es
+mejor que el modelo porque parte del coste de spill se amortiza por
+L1 cache, pero la dirección es la correcta.
+
+### Por qué cooperativo-redundant tampoco gana
+
+Variante alternativa: 4 threads del grupo hacen KDF + key schedule
+**redundantemente** (cada uno computa el mismo MD5 + ks para su candidata
+del grupo). Per-warp: 8 cand / (T_kdf + T_ks + T_dec_coop) — mismo que
+leader-only. La duplicación elimina la idleness del follower pero no
+gana porque la suma de tiempos es la misma a nivel warp.
+
+### Por qué la promesa "AES dominado por register pressure" no aplica
+
+El supuesto del prompt original era: cooperativo libera regs ⇒ más
+occupancy ⇒ más throughput. La realidad medida en este workload:
+
+1. **El KDF (MD5 + hexify) no es paralelizable cooperativamente**: tiene
+   dependencias serial round-by-round, y los 14 B de input caben en 1
+   bloque MD5. El leader hace todo el KDF (~880 ops) mientras los 3
+   followers idle.
+2. **El AES key schedule tampoco**: dependencias `rk[i] = f(rk[i-1],
+   rk[i-Nk])`. Leader-only otra vez.
+3. Solo el AES decrypt (rondas 1..14) admite cooperación natural por
+   columnas. Es ~30 % del coste total por candidata; un 4× de speedup
+   ahí solo da ≈1,18× global por Amdahl.
+
+El kernel legacy se beneficia de procesar 32 candidatas en paralelo
+durante TODO el pipeline (KDF + ks + decrypt), incluso con 84 B de
+spill, porque las 32 latencias se solapan entre sí.
+
+### Decisión
+
+- Kernel activo: **legacy `brute_md5hex_aes256_ecb` (D-029)** sigue
+  siendo el camino de producción.
+- Kernel cooperativo: **mantenido en árbol** (`brute_md5hex_aes256_ecb_coop.cu`,
+  `dump_pt_block0_coop.cu`, `aes_coop.cuh`, `KernelBundleCoop`,
+  `gpu_dump_pt_block0_coop`) como:
+  - Implementación de referencia bit-exact (cross-checking).
+  - Base para futuras variantes (p.ej. cooperative + bitsliced solo
+    para el decrypt, manteniendo KDF escalar).
+  - Toggle opt-in en `quattro-crack benchmark --coop` para reproducir
+    la medición.
+- README documenta el resultado en su sección Performance.
+
+## D-031 — Bitsliced AES-256 evaluado, no implementado
+
+**Contexto**: tras D-030, el siguiente lever teórico era bitsliced AES
+(32 candidatas/warp empaquetadas, S-box como circuito booleano
+Boyar-Peralta de 113 gates).
+
+### Por qué no se intenta
+
+1. **Amdahl bound estricto**: KDF + key schedule = 60 % del coste por
+   candidata, no son bitsliceables (dependencias serial). Bitslicing
+   solo acelera el decrypt (~30-40 % del coste). Speedup máximo
+   teórico:
+   ```
+   1 / (0,6 + 0,4 / 8) = 1,54×
+   ```
+   Eso optimistamente daría ~2,3 GH/s sostenido, no las 6-10 GH/s del
+   estado del arte (que asumen workloads AES-puros sin KDF).
+2. **Coste de implementación**: ~1 000 LOC de CUDA (S-box bitsliced,
+   pack/unpack lineal↔bitsliced, 60 round keys bitsliceadas, MixColumns
+   bitsliced ~152 XOR). Tiempo realista 2-3 semanas. Coste alto.
+3. **Riesgo de correctitud silencioso**: la S-box Boyar-Peralta es un
+   circuito de 113 gates; un solo gate erróneo produce AES incorrecto
+   sin causar SEGV. Tests vs FIPS-197 vector + 1 K random keys son
+   imprescindibles, pero la depuración de un gate incorrecto entre 113
+   es costosa.
+4. **Baseline ya bit-exact y atomically pausable**: el riesgo de meter
+   un kernel bitsliced sutilmente roto en producción con pwd-of-the-day
+   en las narices supera el potencial 1,5×.
+
+### Decisión
+
+Bitsliced **no implementado** en esta sesión. Recomendación: si en
+sesión futura se quiere atacar el techo de hardware, abordar primero
+**MD5 paralelo intra-warp** (8 instancias por warp con 4 threads/MD5
+no funciona por dependencias seriales; pero 32 instancias en bitslice
+sí, potencialmente). El bitslicing tiene sentido si MD5 también se
+bitslicea, no para AES solo.
+
+## D-032 — T2 (persistent kernel) y T4 (Td en `__constant__`) no aplican
+
+**Contexto**: el prompt inicial proponía T2 (persistent kernel para
+eliminar launch overhead) y T4 (Td-tables en `__constant__` con
+broadcast). Tras análisis cuantitativo se descartan ambos.
+
+### T2 — persistent kernel
+
+Overhead real medido por launch:
+
+```
+batch_size = 64 Mi = 67 108 864 candidatas
+throughput = 1,48 GH/s avg
+batch wall time ≈ 67 108 864 / 1,48e9 ≈ 45,3 ms
+launch overhead típico ≈ 5-15 µs
+
+15 µs / 45 300 µs = 0,033 %
+```
+
+Persistent kernel ahorra **0,03 % del tiempo de pared** a costa de:
+- Coordinación host/device más frágil (`atomicAdd` sobre `next_idx`).
+- Integración no-trivial con SIGINT/SIGTERM (flag de stop visible al
+  device).
+- Pinned memory + async transfers para monitorizar progreso.
+
+**Coste/beneficio < 0,1 %, riesgo medio sobre la pausabilidad
+(D-015/D-016 quedarían bajo refactor).** Descartado.
+
+### T4 — Td-tables en `__constant__` (con broadcast)
+
+Comentario explícito en `kernels/aes.cuh` (líneas 12-15):
+
+> "(__shared__ — banco-paralelizable — en lugar de __constant__ —
+>  single-port broadcast que serializa cuando los hilos acceden a
+>  direcciones distintas)"
+
+Este es exactamente el caso del barrido: cada thread accede a una
+posición distinta de Td0/Td1/Td2/Td3 (4 td lookups por columna ×
+4 columnas = 16 td reads per thread per round). En `__constant__`
+con broadcast, las 16 lecturas de cada thread se serializan; en
+`__shared__` con bancos, paralelizan.
+
+T4 sólo ayudaría si los threads del grupo cooperativo leyeran el
+**mismo** offset simultáneamente (broadcast-friendly). En la
+decomposición por columnas que probamos (D-030), no se da: los 4
+threads leen 4 offsets distintos por round.
+
+**Descartado.**
+
+## D-033 — Block 4: barrido de bugs sobre kernel activo + coop
+
+Tests añadidos en `tests/block4_adversarial.rs` (9 tests verdes):
+
+1. `test_boundary_idx_zero_legacy_and_coop_match_reference` — `idx = 0`
+   produce pw `.aAaabbbb1000.` y plaintext bit-exact (CPU == legacy ==
+   coop).
+2. `test_boundary_idx_last_legacy_and_coop_match_reference` —
+   `idx = N-1` produce pw `.zzzzuuuU1999.` y plaintext bit-exact.
+3. `test_boundary_idx_field_transitions` — 12 idx en transiciones
+   críticas entre campos del generador (625, 121 550 625,
+   850 854 375, 59 559 806 250 ± 1).
+4. `test_batch_size_extremes_match_reference` — batches de
+   1, 16, 31, 32, 33, 1023, 1024, 1025, 65535, 65536, 65537. Verifica
+   primero y último idx de cada batch contra reference.
+5. `test_legacy_no_false_positives_1m_random_ct` — 1 M idx, CT no-Leonardo,
+   cero hits emitidos por el kernel legacy.
+6. `test_prefix32_mismatch_synthetic_legacy_and_coop` — CT donde los
+   primeros 16 B del PT matchean Leonardo pero los siguientes 16 NO.
+   Ambos kernels emiten hit (porque solo comparan 16 B); CPU devuelve
+   `HitVerdict::PrefixMismatch32`; el runner lo descarta sin abortar.
+7. `test_cross_verify_cpu_gpu_100_fixed_indices` — 100 idx (95 random
+   con seed + 5 boundaries explícitos: 0, 1, N/2, N−2, N−1) contra
+   ambos kernels y reference.
+8. `test_real_progress_toml_loadable_if_present` — lee
+   `state/progress.toml` real, verifica `next_step ≤ N`,
+   `tried ≥ next_step`, formato Progress vigente.
+9. `test_kernel_runs_from_real_next_step_if_present` — lanza ambos
+   kernels desde el `next_step` real (medido: 2 271 635 046 400 al
+   inicio de la sesión), procesa 4096 idx, compara legacy↔coop
+   byte-a-byte y los primeros/últimos 5 contra reference.
+
+### Bugs encontrados durante el barrido
+
+**Ninguno**. Tanto el kernel legacy como el cooperativo pasaron todos
+los tests adversariales en primer intento. Eso era esperable porque:
+- El generador y la KDF ya estaban blindados por
+  `tests/cpu_gpu_parity.rs` y `tests/kdf.rs`.
+- El path AES-256 + Td-tables había sido validado contra FIPS-197
+  vector C.3 en `tests/aes_fips197.rs`.
+- D-007 (validación de hit en 3 pasos) era ya código probado.
+
+El barrido confirma la robustez del kernel D-029 ante condiciones de
+borde y boundary del espacio.
+
+### Dry-run real de pausa+reanudación contra production state
+
+Ejecutado contra `state/progress.toml` vivo:
+
+```
+backup state/progress.toml: next_step = 2 271 635 046 400
+quattro-crack run --resume    (subprocess background)
+sleep 8 ; SIGINT
+final state/progress.toml:    next_step = 2 300 961 619 968
+delta:                        29 326 573 568 candidatas en 19,57 s
+                              = 1,499 GH/s (matches D-029 baseline)
+last_flush_utc actualizado
+[pausa] elapsed=20,14s; estado guardado en progress.toml. last_step=2300961619968
+```
+
+Reanudación + pausabilidad **funcionando** end-to-end con el state real
+del usuario. El binario retoma desde el `next_step` exacto, persiste
+incrementalmente (D-026, flush cada 8 batches), recibe SIGINT, hace
+flush final, escribe `[pausa]` y sale con código 0.
+
+### Métricas finales tras D-030..D-033
+
+- **95 tests verdes** + 10 ignorados (diagnóstico opt-in). Subida
+  de 81 → 95 por los 14 nuevos tests (5 paridad coop + 9 adversariales).
+- **Clippy `-D warnings` limpio**.
+- Throughput legacy mantenido: 1,49 GH/s avg / 1,82 peak (60 s
+  sostenidos).
+- Cooperativo bit-exact verificado, conservado como referencia
+  (no activo).
+- Resume desde production state validado.
