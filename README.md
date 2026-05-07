@@ -5,7 +5,7 @@ Brute-force CUDA contra la construcción de **cifraronline.com**
 combinatorio `.LLLLLLLL1NNN.` (≈ 5,96 × 10¹³ candidatas).
 
 Pico medido en RTX 5070 Ti: ~6 GH/s. Avg sostenido ~4,3 GH/s.
-Barrido completo en ~3 h 50 min.
+Barrido completo en ~2 h 35 min.
 
 ## Construcción
 
