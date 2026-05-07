@@ -104,6 +104,7 @@ tests/                      d035 (ancla), parity, adversarial, resume,
                             throughput, primitivas FIPS-197 / RFC 1321
 DECISIONS.md                registro de decisiones no obvias
 ```
+<img width="1239" height="584" alt="image" src="https://github.com/user-attachments/assets/b86eaef9-6e17-455f-add4-1a69a6bba365" />
 
 ## Licencia
 
