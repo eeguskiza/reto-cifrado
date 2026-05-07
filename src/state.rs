@@ -24,16 +24,25 @@ use thiserror::Error;
 
 use crate::plan::Plan;
 
+/// Errores de persistencia/carga del estado del barrido.
 #[derive(Debug, Error)]
 pub enum StateError {
+    /// Fallo de I/O (lectura, escritura, fsync, rename).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// Error serializando struct a TOML.
     #[error("toml serialize: {0}")]
     TomlSer(#[from] toml::ser::Error),
+    /// Error parseando TOML — formato malformado o campos incompatibles.
     #[error("toml deserialize: {0}")]
     TomlDe(#[from] toml::de::Error),
+    /// El path destino no tiene directorio padre; impide la escritura
+    /// atómica (que necesita `<dir>/<file>.new` + rename).
     #[error("path no tiene parent dir: {0}")]
     NoParent(PathBuf),
+    /// El fichero TOML pertenece al formato pre-D-029 (multi-config con
+    /// `entries`/`preset`/`per_config`). El usuario debe ejecutar
+    /// `quattro-crack reset --yes`.
     #[error(
         "{path} pertenece a una versión incompatible (pre-D-029, formato \
          multi-config). Lánzalo con `quattro-crack reset --yes` para empezar \

@@ -1,331 +1,253 @@
 # quattro-crack
 
-Brute-force CUDA contra la construcción **cifraronline.com** confirmada
-experimentalmente: AES-128-ECB + passraw (clave directa con null pad) +
-NULL padding + MD5 integrity check del plaintext.
+Brute-force CUDA contra la construcción de **cifraronline.com** (AES-128-ECB
++ passraw + null padding + MD5 verify), con barrido determinista del espacio
+combinatorio `.LLLLLLLL1NNN.` (≈ 5,96 × 10¹³ candidatas).
 
-> Estado: **D-035 completado** (refactor a la construcción real).
->
-> El barrido D-029 (8 h, 100 % del espacio, 0 hits) descartó la
-> construcción asumida. El usuario hizo una prueba experimental: cifró
-> un plaintext y password conocidos en **cifraronline.com** y comparó
-> bit-exact contra el cipher local. Resultado: la construcción es
-> totalmente distinta. Ver D-035 para la historia completa.
->
-> **Construcción real verificada bit-exact contra `pycryptodome`:**
->
-> ```
-> key       = password.encode() + b'\x00' * (16 - len(password.encode()))
-> message   = plaintext + MD5(plaintext).hexdigest().encode()
-> padded    = message + b'\x00' * ((16 - len(message) % 16) % 16)
-> ciphertext = AES-128-ECB.encrypt(padded, key)
-> ```
->
-> Kernel activo: **`brute_passraw_aes128_ecb` (D-035)**. ptxas:
-> 64 regs/thread, 0 spill, 4624 B smem, `__launch_bounds__(128, 8)` →
-> 1024 threads/SM (~67 % occupancy nominal). Sostiene **4,35 GH/s avg /
-> 5,63 GH/s peak** sobre 30 s de benchmark — **2,9× más rápido que
-> D-029** porque el KDF (MD5 + hexify) desaparece del hot path y AES-128
-> es ~25 % más ligero que AES-256.
->
-> El kernel legacy se conserva como `kernels/brute_legacy_aes256.cu`
-> (NO compilado) por si hace falta volver a comparar. La historia
-> completa de optimizaciones (D-029, D-030, D-034) sigue en
-> `DECISIONS.md`.
->
-> **105 tests verdes + 10 ignorados** (D-035 añadió 9 tests específicos
-> y eliminó 5 de coop/d029 ya obsoletos). Clippy limpio con
-> `-D warnings`. ETA del barrido único a 4,35 GH/s avg ≈ **3 h 48 min**.
->
-> Optimizaciones D-025 (batch 64 Mi default), D-026 (flush agrupado
-> cada 8 batches) y D-027 (NVML shim WSL2) heredadas y vigentes.
+> **Reto resuelto** ✅ — clave: `.viTrubio1490.`
+> (Vitruvio + 1490, año del *Hombre de Vitruvio*).
+> Pico medido en producción: **6 GH/s**. Avg sostenido: ~4,3 GH/s.
+> Barrido completo cabe en **~3 h 50 min**.
 
-## Estructura del password objetivo
+---
 
-14 caracteres exactos con la forma `.LLLLLLLL1NNN.`:
-
-- `.` literal
-- 8 letras ASCII `[a-zA-Z]` con **exactamente 4 vocales** (`aeiou`) +
-  **4 consonantes** (las 21 ASCII restantes)
-- **Exactamente 1 mayúscula** entre las 8 letras, y **no** en la primera
-  posición del bloque
-- `1` literal
-- 3 dígitos `NNN`
-- `.` literal
-
-Cardinalidad del espacio:
+## Construcción criptográfica (D-035)
 
 ```
-70 × 625 × 194 481 × 7 × 1000 = 59 559 806 250 000  ≈ 5.96 × 10¹³
-```
-
-## Construcción criptográfica (verificada bit-exact, D-035)
-
-```
-key       = password.encode() + b'\x00' * (16 - len(password.encode()))   # 16 B AES-128
-message   = plaintext + MD5(plaintext).hexdigest().encode()               # plaintext + 32 B integrity
-padded    = message + b'\x00' * ((16 - len(message) % 16) % 16)           # NULL padding (NO PKCS7)
+key       = password.encode() + b'\x00' * (16 - len(password.encode()))
+message   = plaintext + MD5(plaintext).hexdigest().encode()
+padded    = message + b'\x00' * ((16 - len(message) % 16) % 16)
 ciphertext = AES-128-ECB.encrypt(padded, key)
 ```
 
-ECB no usa IV. El fichero objetivo (`./data/cifrado.txt`) son **1616 B
-de ciphertext puros** decodificados desde base64. Como el plaintext de
-≈1584 B + 32 B de MD5 hex = 1616 B exactos, **no hay null padding** en
-este caso particular. La biografía de Leonardo da Vinci en español
-(≈1552 chars con tildes) cabe perfecta.
+- **Clave**: directa, sin KDF. 14 B de password + 2 ceros.
+- **Padding**: NULL (no PKCS7). En el reto el plaintext mide 1584 B y el
+  MD5 hex añade 32 B → 1616 B exactos, sin padding.
+- **Integrity**: los últimos 32 chars del plaintext son `MD5(plaintext_clean).hexdigest()`.
+- **Salto de línea**: el barrido valida LF (`\n`) y CRLF (`\r\n`) en paralelo.
 
-## Validación de hit (3 pasos, D-007 vigente bajo D-035)
+Ver `DECISIONS.md` D-035 para la historia completa (cómo se descubrió la
+construcción real tras 8 h de barrido D-029 fallido).
 
-Una clave es hit confirmado solo si:
+## Estructura del password
 
-1. primeros 16 B del PT = `Leonardo da Vinc` (kernel CUDA)
-2. primeros 32 B del PT matchean **alguna** de:
-   - `Leonardo da Vinci\n\nLeonardo da V` (LF, prueba experimental dio esto)
-   - `Leonardo da Vinci\r\n\r\nLeonardo da` (CRLF, pizarra/Notepad)
-3. tras strippear NULL padding del PT, los últimos 32 chars son
-   `MD5(plaintext_clean).hexdigest()` (CPU)
+14 caracteres con la forma `.LLLLLLLL1NNN.`:
 
-Si pasa (1)+(2) pero falla (3) → bug crítico, runner aborta con
-`Md5MismatchCritical` (probabilidad bajo AES real: ~2⁻¹²⁸).
+- 8 letras ASCII con **4 vocales** + **4 consonantes** + **1 mayúscula no
+  en pos 1 del bloque**.
+- 3 dígitos `NNN` (000..999, año).
+
+Cardinalidad: `70 × 625 × 194 481 × 7 × 1000 = 59 559 806 250 000`.
+
+---
+
+## Requisitos
+
+- Linux o WSL2 con **GPU NVIDIA** visible (`nvidia-smi`).
+- **CUDA Toolkit ≥ 12.8** con `nvcc` en PATH (recomendado 13.0).
+- **Rust** ≥ 1.75 (para `cargo build`).
+- Compute capability ≥ 8.9 (Ada). Nativo a 12.0 (Blackwell, RTX 50xx).
+
+```bash
+nvcc --version          # debe imprimir versión ≥ 12.8
+rustc --version         # ≥ 1.75
+nvidia-smi              # GPU visible
+```
 
 ## Build
 
 ```bash
 cargo build --release
-cargo test --release
 ```
 
-## Uso
+`build.rs` detecta `nvcc` y compila el kernel a PTX para `sm_120` (con
+fallback a `sm_89`). El binario va a `target/release/quattro-crack`.
+
+## Setup WSL2 (una vez por máquina)
 
 ```bash
-# Inspeccionar fichero objetivo (sin IV, ECB)
-quattro-crack inspect ./data/cifrado.txt
-
-# Ver el plan único
-quattro-crack plan
-
-# Persistir plan en state/plan.toml
-quattro-crack plan --save
-
-# Ver estado actual (plan + progreso)
-quattro-crack status
-
-# Lanzar el barrido (plan único, sin presets)
-quattro-crack run
-
-# Reanudar tras pausa
-quattro-crack run --resume
-
-# Borrar state (incluido state legacy pre-D-029)
-quattro-crack reset --yes
-```
-
-## Tiempos estimados
-
-ETA = N / throughput (espacio único, sin presets).
-
-| Throughput                     | ETA                   |
-|--------------------------------|-----------------------|
-| 4,35 GH/s avg (medido D-035)   | ~3 h 48 min           |
-| 5,63 GH/s peak                 | ~2 h 56 min           |
-| 1,48 GH/s avg (D-029, descart) | ~11,2 h               |
-
-D-035 mejora **2,9× sobre D-029** (4,35 vs 1,49 GH/s) porque
-elimina el KDF (MD5 + hexify) del hot path: la clave es directamente
-`pw + null pad`. Más AES-128 vs AES-256 (10 rondas vs 14), ahorra
-~25 % adicional. Sumado, ~3× speedup esperable y medido.
-
-## Performance (post-D-035)
-
-Throughput sobre RTX 5070 Ti, sm_120, batch 128 Mi, 30 s:
-
-| Kernel                                | avg GH/s | peak GH/s | median GH/s | regs / spill / smem    |
-|---------------------------------------|----------|-----------|-------------|------------------------|
-| **D-035 passraw + AES-128** (activo)  | **4,35** | **5,63**  | 4,30        | 64 / 0 B / 4624 B      |
-| D-029 md5hex + AES-256 (legacy)       | 1,49     | 1,82      | 1,42        | 80 / 84 B / 4624 B     |
-| D-030 coop (descartado)               | 0,81     | 0,99      | 0,78        | 96 / 0 B / 12 304 B    |
-
-El kernel D-035 cabe en `__launch_bounds__(128, 8)` (vs `(128, 6)` del
-D-029) gracias a la menor presión de registros: rk[44] vs rk[60] +
-ausencia de MD5 unrolled. Eso da 1024 threads/SM (vs 768 D-029) y cero
-spill stores. La combinación occupancy + menor work-per-candidate
-explica el 2,9× factor.
-
-## Cómo se compone el path activo (D-035)
-
-```
-fichero base64 → 1616 B CT → CT[0..16] al kernel
-                                  ↓
-       idx ∈ [0, N) → password (gen.cuh, 14 B ASCII)
-                          ↓
-       key[16] = pw[0..14] || 0x00 0x00     (passraw, sin MD5 ni hexify)
-                          ↓
-                          AES-128 key schedule (rk[44])
-                                                          ↓
-                          AES-128 decrypt block (rk, CT[0..16])
-                                                          ↓
-                      compara 16 B vs "Leonardo da Vinc" (kernel)
-                                                          ↓
-                                                  match → atomic emit hit
-                                                          ↓
-                                  CPU: validate_hit
-                                  - decrypt todo el ciphertext (1616 B)
-                                  - prefijo-32 LF o CRLF
-                                  - strip null pad → split last 32 = md5_hex
-                                  - MD5(plaintext_clean) == embedded?
-                                                          ↓
-                                                  Confirmed → exit
-```
-
-## Roadmap
-
-- [x] Fase 0 — esqueleto + loader + `inspect`
-- [x] Fase 1 — generador combinatorio CPU
-- [x] Fase 2 — KDFs + descifrado CPU + plan + estado atómico + CLI ampliada
-- [x] Fase 3 — kernels CUDA (gen, MD5, AES-128/192/256, brute parametrizado)
-- [x] Fase 4 — runner + checkpointing + reanudación + signal handling
-- [x] Fase 5 — TUI en vivo + tracing-appender (logs/) + auto-TTY
-- [x] Fase 6 — optimización kernel (launch_bounds + N/thread + Td0 invmix), 1.10 → 2.37 GH/s
-- [x] Fase 7 — flush agrupado + batch 64 Mi default + fix NVML WSL2: runner 0,91 → 1,88 GH/s
-- [x] Fase 8 (D-029) — refactor a única config (AES-256-ECB + md5hex_full), 81 tests verdes
-- [x] Fase 9 (D-030..D-033) — cooperative AES intra-warp **implementado y descartado**
-      por throughput (45 % regresión); barrido de bugs adversariales
-- [x] Fase 10 (D-034) — fix CRLF único en `KNOWN_PREFIX_32` + observabilidad de descartes
-- [x] Fase 11 (D-035) — refactor a la construcción REAL cifraronline.com
-      (passraw + AES-128 + null pad + MD5 verify), 105 tests verdes, 4,35 GH/s avg
-- [ ] Esteganografía (post-barrido) — el plaintext descifrado contiene una frase
-      oculta esteganográficamente; se procesa después de obtener el plaintext.
-
-## Layout de la TUI
-
-```
-quattro-crack v1.0.0 — N = 59559806250000 — AES-128-ECB passraw + MD5 verify (D-035)
-device: NVIDIA GeForce RTX 5070 Ti  ·  batch_size: 67108864  ·  config: passraw / aes-128-ecb / nullpad / md5verify
-
-[Plan]   ████████████████████████████████  1/1 configurations  ·  D-035 single
-[Config] passraw / aes-128-ecb / nullpad / md5verify  ·  AES-128
-[Space]  ████████░░░░░░░░░░░░░░░░░░░░░░░░  25.4000%  1.51e13/5.96e13  ·  ETA 2h47m
-[Speed]  ████████████████████████░░░░░░░░  4.35 GH/s  (peak 5.63, avg 4.30)
-[GPU]    util 98%  ·  mem 4.1/16.0 GB  ·  temp 71°C  ·  power 218W
-[State]  last flush 0.4s ago  ·  next_step 15123456789
-                                                                       Hits found: 0
-                                                                  Elapsed: 0h58m
-                                                          Press Ctrl+C to pause and save state safely.
-```
-
-## Build CUDA
-
-Prerequisitos:
-- CUDA Toolkit ≥ 12.8 (recomendado 13.0). Detectado: `nvcc --version`.
-- GPU NVIDIA con compute capability ≥ 8.9 (Ada) — nativo a 12.0 (Blackwell).
-- Driver compatible (en WSL2: el driver Windows expone CUDA al guest).
-
-`build.rs` automáticamente:
-- Detecta `nvcc` (PATH, `NVCC`, `CUDA_HOME`, rutas estándar).
-- Comprueba si soporta `-arch=sm_120` (Blackwell). Si no, cae a `sm_89` (Ada).
-- Compila el kernel activo `kernels/brute_passraw_aes128_ecb.cu` (D-035) +
-  los kernels auxiliares de tests (`dump_passwords`, `md5_test`,
-  `aes_test`, `force_emit_hits`, `dump_pt_block0` con AES-128). Los
-  kernels legacy AES-256 (`brute_legacy_aes256.cu`,
-  `brute_md5hex_aes256_ecb_coop.cu`, `dump_pt_block0_coop.cu`,
-  `aes_coop.cuh`) quedan en árbol como archival pero NO se compilan.
-
-## Troubleshooting WSL2
-
-### CUDA Toolkit (nvcc)
-
-A partir de Fase 3 hace falta `nvcc` (CUDA Toolkit) en WSL, **no solo el
-driver de Windows**:
-
-```bash
-cd /tmp
+# 1) CUDA Toolkit (NO instales drivers — los provee Windows)
 wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt-get update
-sudo apt-get install -y cuda-toolkit-13-0
+sudo apt-get update && sudo apt-get install -y cuda-toolkit-13-0
 echo 'export PATH=/usr/local/cuda-13.0/bin:$PATH' >> ~/.bashrc
 echo 'export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
 source ~/.bashrc
-```
 
-**No instales** `cuda-drivers-*` ni `nvidia-driver-*` en WSL.
-
-### NVML — línea `[GPU] metrics unavailable` (D-027)
-
-WSL2 expone `libnvidia-ml.so.1` en `/usr/lib/wsl/lib/` pero no crea el
-symlink `libnvidia-ml.so`. Fix:
-
-```bash
-# Con sudo (recomendado, una vez por máquina):
-sudo ln -s /usr/lib/wsl/lib/libnvidia-ml.so.1 /usr/lib/wsl/lib/libnvidia-ml.so
-sudo ldconfig
-
-# Sin sudo (per-usuario):
+# 2) Symlink NVML para la TUI (opcional, sin esto solo se pierde la línea [GPU])
 mkdir -p ~/lib-nvml-shim
 ln -sf /usr/lib/wsl/lib/libnvidia-ml.so.1 ~/lib-nvml-shim/libnvidia-ml.so
 echo 'export LD_LIBRARY_PATH=$HOME/lib-nvml-shim:$LD_LIBRARY_PATH' >> ~/.bashrc
 source ~/.bashrc
 ```
 
-El barrido funciona perfectamente sin NVML; solo se pierden las
-métricas decorativas de la TUI.
+---
 
-### State legacy (pre-D-029 o pre-D-035)
-
-Si tienes un `state/plan.toml` o `state/progress.toml` de antes del
-refactor D-029 (con campos `entries`, `preset`, `per_config`,
-`current_config`...) el binario aborta con mensaje claro pidiendo
-`quattro-crack reset --yes`.
-
-Si tienes un state de D-029..D-034 (`program_version = "0.2.0"`),
-**la construcción cambió por completo en D-035**. El plan será
-rechazado por `same_major()` (0.2.0 vs 1.0.0). Borra y arranca desde
-cero:
+## Uso
 
 ```bash
-quattro-crack reset --yes        # borra state/ legacy
-quattro-crack run                # arranca plan único desde idx=0
-```
+# Inspeccionar el fichero objetivo (sin lanzar barrido).
+quattro-crack inspect ./data/cifrado.txt
 
-### Mi barrido completó al 100 % sin hit, ¿qué hago?
+# Crear/persistir el plan único.
+quattro-crack plan --save
 
-Antes de relanzar a ciegas, **revisa los descartes
-`PrefixMismatch32`** vía `quattro-crack status`:
+# Lanzar el barrido (TUI auto si hay TTY).
+quattro-crack run
 
-```
-prefix32 mismatch    1234 descartes (samples: idx=[100, 250, ...])
-```
+# Reanudar tras pausa (Ctrl+C anterior).
+quattro-crack run --resume
 
-Esa línea aparece solo si `prefix32_mismatch_count > 0`. Significado:
-el kernel reportó hits que coincidían en los 16 primeros bytes
-(`Leonardo da Vinc`) pero la CPU descartó porque los siguientes 16 NO
-matcheaban `KNOWN_PREFIX_32`. Bajo AES-256-ECB con plaintext real,
-esto es ~2⁻¹²⁸ por puro azar — un descarte indica casi seguro un bug
-en `KNOWN_PREFIX_32` o en la KDF/kernel/ciphertext. Ver D-034 para el
-caso real de CRLF único que descartó la clave correcta durante un
-barrido completo de 8 horas.
+# Ver estado actual.
+quattro-crack status
 
-El log también lleva las entradas:
+# Borrar todo el estado.
+quattro-crack reset --yes
 
-```
-INFO PREFIX32_MISMATCH descartado por validación CPU (D-034)
-     idx=... password=... plaintext_first_32_hex=...
-```
-
-Compara `plaintext_first_32_hex` con `KNOWN_PREFIX_32` byte a byte:
-los 16 primeros B siempre coincidirán (es lo que filtra el kernel),
-pero los 16 siguientes te dicen exactamente qué prefijo tiene el
-plaintext real. Si tu constante hardcodeada está mal, ahí lo verás.
-
-## Benchmark
-
-```bash
-# Throughput sostenido del kernel activo (D-035) durante 30 s.
+# Benchmark del kernel (30 s por defecto).
 quattro-crack benchmark --duration 30 --batch-size 134217728
 ```
 
-Códigos de salida: 0 si ≥ 3 GH/s, 1 si entre 2–3 (warning), 2 si < 2.
-En el hardware actual el avg típico de D-035 es 4,3–4,4 GH/s ⇒ exit
-code 0. Para un piso operacional usa el test
-`tests/optimized_kernel_parity.rs::test_throughput_meets_target` que
-exige ≥ 2,0 GH/s.
+### Lanzar como tarea de fondo (recomendado para barrido nocturno)
+
+```bash
+LD_LIBRARY_PATH="$HOME/lib-nvml-shim:$LD_LIBRARY_PATH" \
+  tmux new -s qc -d './target/release/quattro-crack run'
+
+# Adjuntar para mirar la TUI:
+tmux attach -t qc
+
+# Pausar limpio (Ctrl+C dentro del tmux):
+#   - El runner termina el batch en curso, persiste state, sale.
+#   - `tmux attach` y luego `Ctrl+C` o `tmux kill-session -t qc` con SIGINT.
+```
+
+### Pausar/reanudar de forma segura
+
+- **Primer Ctrl+C**: termina el batch en curso, escribe `state/progress.toml`
+  atómicamente, sale con código 0. Se puede reanudar con `--resume`.
+- **Segundo Ctrl+C** durante el shutdown: aborto inmediato (código 130).
+- En el peor caso (SIGKILL/cuelgue) se pierde un único batch — los flushes
+  son atómicos (`tmp → fsync → rename`) y se hace flush forzado en cada
+  evento crítico (hit, error, signal).
+
+---
+
+## Output esperado
+
+Cuando el barrido encuentra la clave imprime en stdout:
+
+```
+HIT  pw='.viTrubio1490.' idx=29097...   elapsed=...s
+```
+
+…y persiste el plaintext completo en `state/progress.toml` campo `hits`.
+
+Si el barrido completa sin hit:
+
+```
+DONE  plan completado SIN hit (13702.12s)
+```
+
+Revisa entonces `state/progress.toml` campo `prefix32_mismatch_count` y
+los logs `logs/run-*.log`. Cualquier descarte > 0 indica que alguna
+hipótesis (LF/CRLF, prefijo, construcción) es falsa — revisa
+`info!` con `plaintext_first_32_hex` para diagnosticar.
+
+---
+
+## Performance (RTX 5070 Ti, sm_120, batch 128 Mi)
+
+| Métrica          | Valor               |
+|------------------|---------------------|
+| **Pico medido**  | **~6 GH/s**         |
+| Avg 30 s bench   | 4,35 GH/s           |
+| Median 30 s      | 4,30 GH/s           |
+| ETA barrido N    | ~3 h 50 min @ 4,3   |
+| ETA barrido N    | ~2 h 45 min @ 6,0   |
+
+El kernel activo (`brute_passraw_aes128_ecb.cu`) usa
+`__launch_bounds__(128, 8)`: 64 regs/thread, **0 spill**, 4624 B smem,
+1024 threads/SM (~67 % occupancy nominal).
+
+Comparativa con kernels descartados:
+
+| Kernel                                    | avg GH/s | nota                          |
+|-------------------------------------------|----------|-------------------------------|
+| **D-035 passraw + AES-128** (activo)      | **4,35** | sin MD5 ni hexify en hot path |
+| D-029 md5hex + AES-256 (legacy)           | 1,49     | KDF dominaba ~60% del coste   |
+| D-030 cooperative AES intra-warp          | 0,81     | descartado por throughput     |
+
+---
+
+## Estructura del repo
+
+```
+src/
+  combinatorics.rs   generador idx ↔ password (bijección)
+  reference.rs       AES-128-ECB CPU + validate_hit + helpers cifraronline
+  cuda.rs            bindings cudarc, KernelBundle, gpu_dump_pt_block0
+  runner.rs          orquestación del barrido + checkpointing
+  state.rs           persistencia atómica (plan.toml, progress.toml)
+  plan.rs            descripción de la única configuración
+  tui.rs             renderer en vivo (5 Hz) desacoplado por canal
+  gpu_metrics.rs     muestreo NVML (util/mem/temp/power)
+  signal.rs          handlers SIGINT/SIGTERM con shutdown limpio
+  ciphertext.rs      loader del fichero base64 → 1616 B
+  kdf.rs             passraw + catálogo legacy de 14 KDFs (tests)
+  main.rs            CLI (clap) — inspect / plan / run / status / reset / benchmark
+
+kernels/
+  brute_passraw_aes128_ecb.cu    kernel ACTIVO D-035
+  brute_legacy_aes256.cu         kernel D-029 archivado (no compilado)
+  aes.cuh / aes_tables.cuh       primitivas AES-128/192/256 + Td-tables
+  md5.cuh                        MD5 device (RFC 1321)
+  gen.cuh                        generador device (espejo de combinatorics.rs)
+
+tests/
+  d035_cifraronline_construction.rs   vector experimental bit-exact + 9 tests
+  optimized_kernel_parity.rs          1M idx CPU↔GPU bit-exact + throughput
+  block4_adversarial.rs               boundaries + batch sizes + false positives
+  resume.rs / runner_throughput.rs    pausa/reanuda + flush agrupado
+  aes_fips197.rs / md5_rfc1321.rs     primitivas vs vectores estándar
+  ...
+```
+
+---
+
+## Tests
+
+```bash
+cargo test --release             # 105 tests verdes + 10 ignored (diagnóstico opt-in)
+cargo clippy --release --all-targets -- -D warnings   # lint clean
+```
+
+El test ancla es
+`tests/d035_cifraronline_construction.rs::test_experimental_vector_bit_exact`:
+cifra el vector experimental conocido y compara byte-a-byte con el resultado
+de cifraronline.com. Si falla, **toda la construcción está mal**.
+
+---
+
+## Troubleshooting
+
+### `[GPU] metrics unavailable`
+Falta el symlink NVML en WSL2. Ver "Setup WSL2" arriba.
+El barrido funciona intacto sin esto; solo se pierde la línea decorativa.
+
+### `LegacyFormat` al reanudar
+Tienes un `state/` de versión vieja (pre-D-035). Solución:
+```bash
+quattro-crack reset --yes
+quattro-crack run
+```
+
+### El fichero objetivo cambió
+`source_sha256` en `plan.toml` no coincide con el actual. O repón el
+fichero original o usa `quattro-crack reset --yes`.
+
+---
+
+## Licencia
+
+MIT OR Apache-2.0.

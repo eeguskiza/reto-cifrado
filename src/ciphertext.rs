@@ -24,6 +24,7 @@ pub const CT_BLOCKS: usize = TOTAL_BIN_LEN / 16;
 /// Errores de carga del ciphertext.
 #[derive(Debug, Error)]
 pub enum CiphertextError {
+    /// Fallo de I/O abriendo o leyendo el fichero.
     #[error("no se pudo leer el fichero {path}: {source}")]
     Read {
         path: PathBuf,
@@ -31,9 +32,13 @@ pub enum CiphertextError {
         source: std::io::Error,
     },
 
+    /// El contenido del fichero no es base64 válido (incluso tras quitar
+    /// whitespace y padding tolerante).
     #[error("base64 inválido: {0}")]
     Base64(#[from] base64::DecodeError),
 
+    /// El binario decodificado tiene un tamaño que no coincide con
+    /// `TOTAL_BIN_LEN` (1616 B = 101 bloques AES).
     #[error(
         "tamaño binario inesperado: {actual} bytes (se esperaban {expected} = {blocks} bloques AES de 16 B)"
     )]
@@ -43,6 +48,9 @@ pub enum CiphertextError {
         blocks: usize,
     },
 
+    /// El binario decodificado no es múltiplo de 16 B (no se puede
+    /// dividir en bloques AES). Nunca debería ocurrir si `WrongSize`
+    /// pasa primero, pero se mantiene como salvaguarda.
     #[error("el ciphertext debe ser múltiplo de 16 (bloque AES); tiene {0} bytes")]
     NotBlockAligned(usize),
 }

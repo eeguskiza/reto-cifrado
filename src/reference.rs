@@ -99,10 +99,15 @@ pub enum HitVerdict {
     },
 }
 
+/// Errores del path AES.
 #[derive(Debug, Error)]
 pub enum DecryptError {
+    /// Solo aplica a los helpers legacy CBC; el path activo D-035
+    /// requiere clave de 16 B exactos (AES-128).
     #[error("longitud de clave no soportada: {0} (esperado 16, 24 o 32)")]
     BadKeyLen(usize),
+    /// El ciphertext no es múltiplo de 16 B, no se puede dividir en
+    /// bloques AES.
     #[error("ciphertext no alineado a 16 B: {0}")]
     Unaligned(usize),
 }

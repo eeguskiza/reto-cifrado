@@ -24,29 +24,38 @@
 
 use thiserror::Error;
 
-/// Vocabularios.
+/// Vocales válidas en cualquier posición de vocal del bloque de 8 letras.
 pub const VOWELS: &[u8; 5] = b"aeiou";
+/// Consonantes válidas (las 21 letras ASCII restantes tras quitar vocales).
 pub const CONSONANTS: &[u8; 21] = b"bcdfghjklmnpqrstvwxyz";
 
-/// Longitud del password en bytes.
+/// Longitud fija del password en bytes ASCII (incluye los `.` y el `1` literal).
 pub const PW_LEN: usize = 14;
 
-/// Tamaños de cada campo.
+/// Cardinalidad del campo `year` (3 dígitos `NNN` ∈ 000..999).
 pub const N_YEAR: u64 = 1_000;
+/// Cardinalidad del campo `disp` (`C(8,4) = 70` disposiciones de vocales).
 pub const N_DISP: u64 = 70;
+/// Cardinalidad del campo `upper` (7 posiciones válidas de la mayúscula).
 pub const N_UPPER: u64 = 7;
-pub const N_CONS: u64 = 21 * 21 * 21 * 21; // 194_481
-pub const N_VOWEL: u64 = 5 * 5 * 5 * 5; // 625
+/// Cardinalidad del campo `cons` (`21⁴ = 194 481` combos de consonantes).
+pub const N_CONS: u64 = 21 * 21 * 21 * 21;
+/// Cardinalidad del campo `vowel` (`5⁴ = 625` combos de vocales).
+pub const N_VOWEL: u64 = 5 * 5 * 5 * 5;
 
-/// Multiplicadores acumulados (peso de cada campo).
+/// Multiplicador acumulado de `vowel` (LSB del idx).
 pub const M_VOWEL: u64 = 1;
+/// Multiplicador acumulado de `cons` (= `N_VOWEL`).
 pub const M_CONS: u64 = N_VOWEL;
-pub const M_UPPER: u64 = N_CONS * N_VOWEL; // 121_550_625
-pub const M_DISP: u64 = N_UPPER * M_UPPER; // 850_854_375
-pub const M_YEAR: u64 = N_DISP * M_DISP; // 59_559_806_250
+/// Multiplicador acumulado de `upper` (= 121 550 625).
+pub const M_UPPER: u64 = N_CONS * N_VOWEL;
+/// Multiplicador acumulado de `disp` (= 850 854 375).
+pub const M_DISP: u64 = N_UPPER * M_UPPER;
+/// Multiplicador acumulado de `year` — peso mayor (= 59 559 806 250).
+pub const M_YEAR: u64 = N_DISP * M_DISP;
 
-/// Cardinalidad total del espacio. Ver `DECISIONS.md` D-001.
-pub const N: u64 = N_YEAR * M_YEAR; // 59_559_806_250_000
+/// Cardinalidad total del espacio combinatorio (≈ 5,96 × 10¹³). Ver D-001.
+pub const N: u64 = N_YEAR * M_YEAR;
 
 /// 70 disposiciones lexicográficas de `C(8, 4)`: qué 4 posiciones del bloque
 /// de 8 letras (0-indexado) llevan vocal. Las otras 4 llevan consonante.
@@ -81,18 +90,28 @@ const fn build_dispositions() -> [[u8; 4]; 70] {
 /// Errores al parsear un password en su índice.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ParseError {
+    /// Las posiciones literal `.LLLLLLLL1NNN.` (índices 0, 9, 13) no
+    /// contienen los caracteres esperados.
     #[error("frame inválido: pos 0/9/13 deben ser '.', '1', '.'")]
     Frame,
+    /// La posición indicada (en el bloque `NNN`) no es un dígito ASCII.
     #[error("posición {0} no es dígito")]
     NotDigit(usize),
+    /// La posición indicada (en el bloque de 8 letras) no es ASCII alfabético.
     #[error("posición {0} no es letra ASCII")]
     NotLetter(usize),
+    /// El bloque de 8 letras no contiene exactamente 1 mayúscula.
     #[error("número de mayúsculas != 1")]
     UppercaseCount,
+    /// La única mayúscula está en `letters[0]` (posición 0 del bloque),
+    /// que no es válida según el espacio del reto.
     #[error("la única mayúscula está en la primera letra (no permitido)")]
     UppercaseAtFirst,
+    /// El bloque de 8 letras no contiene exactamente 4 vocales (`aeiou`).
     #[error("número de vocales != 4")]
     VowelCount,
+    /// La letra en esa posición no pertenece ni a `VOWELS` ni a
+    /// `CONSONANTS` (p. ej., una vocal acentuada o letra fuera de ASCII).
     #[error("posición {0} no es vocal de aeiou ni consonante de las 21 ASCII")]
     InvalidLetter(usize),
 }
