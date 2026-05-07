@@ -12,11 +12,18 @@
 use serde::{Deserialize, Serialize};
 
 /// Descripción legible de la única configuración activa.
-pub const SINGLE_PLAN_DESCRIPTION: &str = "md5hex_full / aes-256-ecb / pkcs7";
+///
+/// Tras D-035 (refactor a la construcción real cifraronline.com): la
+/// clave es `password.encode() + null pad` (sin MD5 ni hexify), AES-128,
+/// ECB, NULL padding sobre `plaintext + MD5(plaintext).hexdigest()` para
+/// integrity check.
+pub const SINGLE_PLAN_DESCRIPTION: &str = "passraw / aes-128-ecb / nullpad / md5verify";
 
 /// Bumpa con cada cambio incompatible del formato del plan o del kernel.
-/// Pre-D-029 era `0.1.0`; tras D-029 sube a `0.2.0`.
-pub const PLAN_FORMAT_VERSION: &str = "0.2.0";
+/// Pre-D-029 era `0.1.0`; tras D-029 fue `0.2.0`; tras D-035 sube a
+/// `1.0.0` (la construcción criptográfica cambió por completo, los
+/// planes y states pre-D-035 son inservibles).
+pub const PLAN_FORMAT_VERSION: &str = "1.0.0";
 
 /// Plan persistible — lo que va a `state/plan.toml`.
 ///
@@ -73,9 +80,10 @@ mod tests {
 
     #[test]
     fn description_is_stable_label() {
-        assert!(SINGLE_PLAN_DESCRIPTION.contains("md5hex_full"));
-        assert!(SINGLE_PLAN_DESCRIPTION.contains("aes-256-ecb"));
-        assert!(SINGLE_PLAN_DESCRIPTION.contains("pkcs7"));
+        assert!(SINGLE_PLAN_DESCRIPTION.contains("passraw"));
+        assert!(SINGLE_PLAN_DESCRIPTION.contains("aes-128-ecb"));
+        assert!(SINGLE_PLAN_DESCRIPTION.contains("nullpad"));
+        assert!(SINGLE_PLAN_DESCRIPTION.contains("md5verify"));
     }
 
     #[test]

@@ -1,42 +1,33 @@
-//! End-to-end sintéticos post-D-029: ciframos un plaintext con la
-//! única configuración (`md5hex_full / aes-256-ecb / pkcs7`) y
-//! verificamos que el kernel CUDA encuentra la clave en su rango.
+//! End-to-end sintéticos post-D-035: ciframos un plaintext con la
+//! única configuración real (`passraw / aes-128-ecb / nullpad /
+//! md5verify`) y verificamos que el kernel CUDA encuentra la clave en
+//! su rango y que la CPU confirma con MD5 verify.
 
 use std::time::Instant;
 
 use quattro_crack::combinatorics::{password_to_index, N};
 use quattro_crack::cuda::{gpu_force_emit_hits, CudaCtx, KernelBundle};
-use quattro_crack::kdf::derive_md5hex;
-use quattro_crack::reference::{encrypt_ecb_pkcs7, validate_hit, HitVerdict, KNOWN_PREFIX_32};
-
-/// Construye un plaintext de 1600 B que empieza con KNOWN_PREFIX_32 y
-/// rellena con 'X' hasta cubrir 100 bloques. `encrypt_ecb_pkcs7` añade
-/// 16 B de padding produciendo un CT de 1616 B = 101 bloques (matches
-/// `Ciphertext::TOTAL_BIN_LEN`).
-fn build_plaintext_1600() -> Vec<u8> {
-    let mut pt = Vec::with_capacity(1600);
-    pt.extend_from_slice(KNOWN_PREFIX_32);
-    while pt.len() < 1600 {
-        pt.push(b'X');
-    }
-    pt
-}
+use quattro_crack::reference::{
+    build_key_passraw, encrypt_cifraronline, validate_hit, HitVerdict, KNOWN_PREFIX_32_LF,
+};
 
 #[test]
-fn test_e2e_synthetic_ecb_md5hex_finds_synthetic_hit() {
-    // Password real del espacio.
+fn test_e2e_synthetic_passraw_aes128_finds_synthetic_hit() {
     let pw = b".lEonardo1452.";
-    let target_idx = password_to_index(pw).expect("pw valido del espacio");
+    let target_idx = password_to_index(pw).expect("pw válido del espacio");
     eprintln!("target idx = {target_idx} (de N = {N})");
 
-    let key = derive_md5hex(pw);
-    let pt = build_plaintext_1600();
-    let ct = encrypt_ecb_pkcs7(&key, &pt);
-    assert_eq!(ct.len(), 1616);
+    let mut plaintext = Vec::new();
+    plaintext.extend_from_slice(KNOWN_PREFIX_32_LF);
+    plaintext.extend_from_slice(b" cuerpo del mensaje sintetico para D-035.");
+
+    let key = build_key_passraw(pw);
+    let ct = encrypt_cifraronline(&key, &plaintext);
+    assert_eq!(ct.len() % 16, 0);
     let ct_block_0: [u8; 16] = ct[..16].try_into().unwrap();
 
     let ctx = CudaCtx::init().expect("CUDA");
-    let mut bundle = KernelBundle::load(&ctx).expect("load kernel ECB md5hex");
+    let mut bundle = KernelBundle::load(&ctx).expect("load kernel passraw + AES-128");
 
     const RANGE: u64 = 200_000;
     let idx_base = target_idx.saturating_sub(RANGE / 2);
@@ -48,7 +39,7 @@ fn test_e2e_synthetic_ecb_md5hex_finds_synthetic_hit() {
         .expect("launch");
     let elapsed = started.elapsed();
     eprintln!(
-        "ECB md5hex launched {idx_count} idx in {:?} → {:.2} M idx/s, hits={}",
+        "passraw + AES-128 launched {idx_count} idx in {:?} → {:.2} M idx/s, hits={}",
         elapsed,
         idx_count as f64 / elapsed.as_secs_f64() / 1.0e6,
         hits.len()
@@ -87,11 +78,18 @@ fn test_hit_buffer_handles_100_simultaneous_hits() {
     assert_eq!(hits.len(), 1024);
 
     let (count, hits) = gpu_force_emit_hits(&ctx, 2048).expect("force 2048");
-    assert_eq!(count, 2048, "contador atómico cuenta TODOS los hits, capped o no");
-    assert_eq!(hits.len(), 1024, "solo se leen los primeros 'capacity' slots");
+    assert_eq!(
+        count, 2048,
+        "contador atómico cuenta TODOS los hits, capped o no"
+    );
+    assert_eq!(
+        hits.len(),
+        1024,
+        "solo se leen los primeros 'capacity' slots"
+    );
 }
 
-/// Throughput sostenido aproximado del kernel ECB md5hex.
+/// Throughput sostenido aproximado del kernel D-035.
 #[test]
 fn test_throughput_sustained() {
     let ctx = CudaCtx::init().unwrap();
@@ -114,12 +112,10 @@ fn test_throughput_sustained() {
             best_ghs = ghs;
         }
     }
-    eprintln!(
-        "throughput md5hex_full / AES-256-ECB sostenido (best of 5) ≈ {best_ghs:.3} GH/s"
-    );
+    eprintln!("throughput passraw + AES-128-ECB sostenido (best of 5) ≈ {best_ghs:.3} GH/s");
     assert!(
-        best_ghs >= 1.0,
-        "throughput {best_ghs:.3} GH/s por debajo del piso 1 GH/s; \
-         algo va muy mal con el kernel"
+        best_ghs >= 2.0,
+        "throughput {best_ghs:.3} GH/s por debajo del piso 2 GH/s; \
+         algo va muy mal con el kernel D-035 (debería ser 4-7 GH/s)"
     );
 }

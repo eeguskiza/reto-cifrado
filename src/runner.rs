@@ -1,9 +1,12 @@
 //! Runner — orquesta el barrido CUDA con checkpointing y reanudación.
 //!
-//! Tras D-029 el barrido tiene **una única configuración**
-//! (`md5hex_full / aes-256-ecb / pkcs7`), por lo que el runner deja de
-//! iterar `plan.entries`: simplemente avanza `progress.next_step` hasta
-//! `N` o hasta encontrar el hit.
+//! Tras D-035 (refactor a la construcción real cifraronline.com), el
+//! barrido sigue teniendo **una única configuración** pero ahora es
+//! `passraw / aes-128-ecb / nullpad / md5verify`. El runner sigue
+//! avanzando `progress.next_step` hasta `N` o hasta encontrar el hit;
+//! la KDF en hot path desaparece (ya no hay MD5 ni hexify por
+//! candidata) — la clave se construye trivialmente como
+//! `password.encode() + null pad`.
 //!
 //! Contrato (heredado de Fase 4 + D-026):
 //!
@@ -12,8 +15,9 @@
 //! - **Verificaciones al reanudar**: SHA-256 del fichero objetivo y
 //!   `same_major(program_version)`. Si difieren, ABORTAR.
 //! - **Validación de hits**: `validate_hit` (3 pasos: prefijo-16
-//!   kernel, prefijo-32 CPU, PKCS7). PKCS7 fallido → evento crítico
-//!   (D-007).
+//!   kernel, prefijo-32 LF/CRLF CPU, MD5 integrity check). MD5 fallido
+//!   tras prefijo-32 OK → evento crítico (`Md5MismatchCritical`,
+//!   equivalente al viejo `Pkcs7Mismatch` pre-D-035).
 //! - **Apagado limpio**: stop flag entre batches.
 
 use std::io::Write;
@@ -28,9 +32,8 @@ use tracing::{debug, error, info, warn};
 use crate::ciphertext::Ciphertext;
 use crate::combinatorics::{index_to_password, N};
 use crate::cuda::{CudaCtx, KernelBundle};
-use crate::kdf::derive_md5hex;
 use crate::plan::{Plan, SINGLE_PLAN_DESCRIPTION};
-use crate::reference::{validate_hit, HitVerdict};
+use crate::reference::{build_key_passraw, validate_hit, HitVerdict, LineEnding};
 use crate::state::{
     load_plan, load_progress_with_bak, save_plan, save_progress_with_bak, Hit, Progress,
 };
@@ -46,8 +49,9 @@ pub trait ProgressSink: Send + Sync {
     fn on_event(&self, event: ProgressEvent);
 }
 
-/// Eventos del runner. Tras D-029, `ConfigStarted`/`ConfigCompleted`/
-/// `total_configs` desaparecen porque solo hay una config implícita.
+/// Eventos del runner. Tras D-035, `HitConfirmed` lleva el `LineEnding`
+/// detectado (LF o CRLF) y el evento crítico se renombra a
+/// `HitCriticalMd5Mismatch`.
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     PlanLoaded {
@@ -83,14 +87,18 @@ pub enum ProgressEvent {
         password: String,
         idx: u64,
         plaintext_hex_first_32: String,
+        line_ending: LineEnding,
         elapsed_total: Duration,
     },
     HitDiscardedPrefixMismatch {
         idx: u64,
     },
-    HitCriticalPkcs7Mismatch {
+    HitCriticalMd5Mismatch {
         idx: u64,
         password: String,
+        line_ending: LineEnding,
+        embedded_md5_hex: String,
+        computed_md5_hex: String,
     },
     Paused {
         last_step: u64,
@@ -103,7 +111,7 @@ pub enum ProgressEvent {
 }
 
 // ============================================================================
-// StderrSink — formato Fase 4 simplificado tras D-029
+// StderrSink — formato Fase 4 simplificado tras D-029, adaptado D-035
 // ============================================================================
 
 pub struct StderrSink<W: Write + Send> {
@@ -178,31 +186,66 @@ where
                 password,
                 idx,
                 plaintext_hex_first_32,
+                line_ending,
                 elapsed_total,
             } => {
-                let _ = writeln!(w, "================================================================");
-                let _ = writeln!(w, "  HIT CONFIRMADO  idx={}  pw='{}'", idx, password);
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+                let _ = writeln!(
+                    w,
+                    "  HIT CONFIRMADO  idx={}  pw='{}'  line_ending={}",
+                    idx,
+                    password,
+                    line_ending.as_str()
+                );
                 let _ = writeln!(
                     w,
                     "  elapsed={:.2}s   plaintext[..32]={}",
                     elapsed_total.as_secs_f64(),
                     plaintext_hex_first_32
                 );
-                let _ = writeln!(w, "================================================================");
-            }
-            ProgressEvent::HitCriticalPkcs7Mismatch { idx, password } => {
-                let _ = writeln!(w, "================================================================");
                 let _ = writeln!(
                     w,
-                    "CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO en idx={} pw='{}'",
-                    idx, password
+                    "================================================================"
                 );
-                let _ = writeln!(w, "Probabilidad bajo ECB+PKCS7 real: ~2^-130 → casi seguro un BUG.");
-                let _ = writeln!(w, "Posibles causas: KDF rota / kernel rota / ciphertext corrupto.");
-                let _ = writeln!(w, "ABORTANDO el barrido. Estado guardado para inspección.");
-                let _ = writeln!(w, "================================================================");
             }
-            ProgressEvent::Paused { last_step, elapsed_total } => {
+            ProgressEvent::HitCriticalMd5Mismatch {
+                idx,
+                password,
+                line_ending,
+                embedded_md5_hex,
+                computed_md5_hex,
+            } => {
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+                let _ = writeln!(
+                    w,
+                    "CRITICAL: prefijo-32 ({}) OK pero MD5 INTEGRITY MISMATCH en idx={} pw='{}'",
+                    line_ending.as_str(),
+                    idx,
+                    password
+                );
+                let _ = writeln!(w, "  embedded MD5(hex): {embedded_md5_hex}");
+                let _ = writeln!(w, "  computed MD5(hex): {computed_md5_hex}");
+                let _ = writeln!(
+                    w,
+                    "Probabilidad bajo AES real: ~2^-128 → casi seguro un BUG."
+                );
+                let _ = writeln!(w, "Posibles causas: kernel rota / construcción mal copiada / ciphertext corrupto.");
+                let _ = writeln!(w, "ABORTANDO el barrido. Estado guardado para inspección.");
+                let _ = writeln!(
+                    w,
+                    "================================================================"
+                );
+            }
+            ProgressEvent::Paused {
+                last_step,
+                elapsed_total,
+            } => {
                 let _ = writeln!(
                     w,
                     "[pausa] elapsed={:.2}s; estado guardado en progress.toml. \
@@ -251,11 +294,7 @@ pub enum RunOutcome {
     Paused { elapsed_secs: f64, last_step: u64 },
 }
 
-pub fn run(
-    opts: RunOptions,
-    sink: &dyn ProgressSink,
-    stop: Arc<AtomicBool>,
-) -> Result<RunOutcome> {
+pub fn run(opts: RunOptions, sink: &dyn ProgressSink, stop: Arc<AtomicBool>) -> Result<RunOutcome> {
     let plan_path = opts.state_dir.join(PLAN_BASENAME);
     let progress_path = opts.state_dir.join(PROGRESS_BASENAME);
 
@@ -404,24 +443,23 @@ pub fn run(
         progress.elapsed_us += batch_elapsed.as_micros() as u64;
         batches_run += 1;
 
-        // Validación CPU de cada hit reportado por el kernel.
+        // Validación CPU de cada hit reportado por el kernel (D-035).
         for dh in &device_hits {
             let pw_arr = index_to_password(dh.idx);
             let pw_utf8: &[u8] = &pw_arr;
-            let key = derive_md5hex(pw_utf8);
+            let key = build_key_passraw(pw_utf8);
 
-            let verdict =
-                validate_hit(&key, ct.ct()).context("validate_hit")?;
+            let verdict = validate_hit(&key, ct.ct()).context("validate_hit")?;
             match verdict {
-                HitVerdict::Confirmed { plaintext } => {
+                HitVerdict::Confirmed {
+                    plaintext,
+                    line_ending,
+                } => {
                     let pw_str = std::str::from_utf8(pw_utf8)
                         .unwrap_or("<no utf8>")
                         .to_string();
                     let pt_hex = hex::encode(&plaintext);
-                    let pt_first_32 = pt_hex
-                        .get(..64)
-                        .unwrap_or(pt_hex.as_str())
-                        .to_string();
+                    let pt_first_32 = pt_hex.get(..64).unwrap_or(pt_hex.as_str()).to_string();
                     let hit = Hit {
                         idx: dh.idx,
                         password: pw_str.clone(),
@@ -436,11 +474,13 @@ pub fn run(
                         password: pw_str.clone(),
                         idx: dh.idx,
                         plaintext_hex_first_32: pt_first_32,
+                        line_ending,
                         elapsed_total: elapsed,
                     });
                     info!(
                         idx = dh.idx,
                         pw = %pw_str,
+                        line_ending = line_ending.as_str(),
                         elapsed_s = elapsed.as_secs_f64(),
                         "HIT CONFIRMED"
                     );
@@ -449,23 +489,36 @@ pub fn run(
                         elapsed_secs: elapsed.as_secs_f64(),
                     });
                 }
-                HitVerdict::Pkcs7Mismatch { .. } => {
+                HitVerdict::Md5MismatchCritical {
+                    embedded_md5_hex,
+                    computed_md5_hex,
+                    line_ending,
+                    ..
+                } => {
                     let pw_str = std::str::from_utf8(pw_utf8)
                         .unwrap_or("<no utf8>")
                         .to_string();
-                    sink.on_event(ProgressEvent::HitCriticalPkcs7Mismatch {
+                    let emb_hex = String::from_utf8_lossy(&embedded_md5_hex).to_string();
+                    let com_hex = String::from_utf8_lossy(&computed_md5_hex).to_string();
+                    sink.on_event(ProgressEvent::HitCriticalMd5Mismatch {
                         idx: dh.idx,
                         password: pw_str.clone(),
+                        line_ending,
+                        embedded_md5_hex: emb_hex.clone(),
+                        computed_md5_hex: com_hex.clone(),
                     });
                     error!(
                         idx = dh.idx,
                         pw = %pw_str,
-                        "CRITICAL: prefijo-32 OK pero PKCS7 inválido"
+                        line_ending = line_ending.as_str(),
+                        embedded = %emb_hex,
+                        computed = %com_hex,
+                        "CRITICAL: prefijo-32 OK pero MD5 integrity mismatch"
                     );
                     progress.last_flush_utc = utc_now();
                     save_progress_with_bak(&progress_path, &progress)?;
                     return Err(anyhow!(
-                        "Pkcs7Mismatch evento crítico (idx={}) — ver D-007",
+                        "Md5MismatchCritical evento crítico (idx={}) — ver D-035",
                         dh.idx
                     ));
                 }
@@ -478,7 +531,7 @@ pub fn run(
                         idx = dh.idx,
                         password = %pw_str,
                         plaintext_first_32_hex = %hex::encode(plaintext_first_32),
-                        "PREFIX32_MISMATCH descartado por validación CPU (D-034)"
+                        "PREFIX32_MISMATCH descartado por validación CPU (D-034/D-035)"
                     );
                     progress.prefix32_mismatch_count =
                         progress.prefix32_mismatch_count.saturating_add(1);
@@ -532,7 +585,7 @@ pub fn run(
              Revisa state/progress.toml campo prefix32_mismatch_idx_samples \
              para diagnóstico. Esto NO debería ocurrir si la construcción \
              criptográfica es correcta — un descarte indica un bug \
-             potencial en la constante KNOWN_PREFIX_32 (D-034).",
+             potencial en KNOWN_PREFIX_32_LF/CRLF (D-035) o en la KDF.",
             progress.prefix32_mismatch_count
         );
     }

@@ -1,21 +1,23 @@
-// dump_pt_block0.cu — kernel de diagnóstico SOLO para tests.
+// dump_pt_block0.cu — kernel de diagnóstico SOLO para tests (D-035).
 //
-// Tras D-029: produce el plaintext de los primeros 16 B del CT objetivo
-// bajo la única configuración activa:
+// Tras D-035: produce el plaintext de los primeros 16 B del CT objetivo
+// bajo la única configuración activa real:
 //
-//   key = MD5(pw_utf8).hexdigest().encode("ascii")  // 32 B AES-256
-//   AES-256-ECB                                       // sin IV
+//   key  = password.encode() + b'\x00' * (16 - len(password.encode()))
+//          (passraw, sin MD5 ni hexify)
+//   mode = AES-128-ECB        (sin IV)
 //
-// Reutiliza las mismas primitivas (md5_compute, aes256_decrypt_block_ptr)
-// que el brute_kernel monolítico, así que si este kernel produce los
-// plaintexts correctos byte-a-byte, el de barrido también.
+// Reutiliza las mismas primitivas (`aes128_set_key_with_tables`,
+// `aes128_decrypt_block_ptr`) que el `brute_kernel` activo de D-035, así
+// que si este kernel produce los plaintexts correctos byte-a-byte, el de
+// barrido también.
 //
-// Validación bit-exact frente a `reference::decrypt_ecb_raw` de CPU
-// vive en `tests/optimized_kernel_parity.rs`.
+// Validación bit-exact frente a `reference::decrypt_aes128_ecb_raw` de
+// CPU vive en `tests/optimized_kernel_parity.rs` y
+// `tests/d035_cifraronline_construction.rs`.
 
 #include <stdint.h>
 #include "gen.cuh"
-#include "md5.cuh"
 #include "aes.cuh"
 
 extern "C" __global__ void dump_pt_block0(
@@ -57,23 +59,18 @@ extern "C" __global__ void dump_pt_block0(
     uint8_t pw[14];
     index_to_password(idx, pw);
 
-    // md5hex_full: raw → ASCII hex lowercase, 32 B.
-    uint8_t md5_raw[16];
-    md5_compute(pw, 14, md5_raw);
-    uint8_t key[32];
+    // passraw: key[16] = pw[14] || 0x00 0x00. SIN MD5 ni hexify.
+    uint8_t key[16];
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        uint8_t hi = (uint8_t)((md5_raw[i] >> 4) & 0xfu);
-        uint8_t lo = (uint8_t)(md5_raw[i] & 0xfu);
-        key[i * 2 + 0] = (uint8_t)((hi < 10u) ? ('0' + hi) : ('a' + hi - 10u));
-        key[i * 2 + 1] = (uint8_t)((lo < 10u) ? ('0' + lo) : ('a' + lo - 10u));
-    }
+    for (int i = 0; i < 14; ++i) key[i] = pw[i];
+    key[14] = 0;
+    key[15] = 0;
 
-    uint32_t rk[60];
-    aes256_set_key_with_tables(key, rk, s_td0, s_sbox);
+    uint32_t rk[44];
+    aes128_set_key_with_tables(key, rk, s_td0, s_sbox);
 
     // ECB: pt_real = pt_block (sin XOR de IV).
     uint8_t* out = pt_out + tid * 16;
-    aes256_decrypt_block_ptr(rk, s_ct, out,
+    aes128_decrypt_block_ptr(rk, s_ct, out,
         s_td0, s_td1, s_td2, s_td3, s_isbox);
 }

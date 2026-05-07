@@ -170,9 +170,7 @@ pub fn password_to_index(pw: &[u8; PW_LEN]) -> Result<u64, ParseError> {
             return Err(ParseError::NotDigit(i));
         }
     }
-    let year = (pw[10] - b'0') as u64 * 100
-        + (pw[11] - b'0') as u64 * 10
-        + (pw[12] - b'0') as u64;
+    let year = (pw[10] - b'0') as u64 * 100 + (pw[11] - b'0') as u64 * 10 + (pw[12] - b'0') as u64;
 
     let letters = &pw[1..9];
     for (i, &c) in letters.iter().enumerate() {
@@ -221,8 +219,7 @@ pub fn password_to_index(pw: &[u8; PW_LEN]) -> Result<u64, ParseError> {
     let disp = DISPOSITIONS
         .iter()
         .position(|d| *d == vowel_positions)
-        .expect("vowel_positions están en 0..8 ordenadas: hay disposición")
-        as u64;
+        .expect("vowel_positions están en 0..8 ordenadas: hay disposición") as u64;
 
     // Reconstruye los valores base-5 (vocales) y base-21 (consonantes).
     // Convención MSB-first: la posición de vocal/consonante más baja
@@ -320,10 +317,7 @@ mod tests {
     #[test]
     fn roundtrip_endpoints() {
         assert_eq!(password_to_index(&index_to_password(0)).unwrap(), 0);
-        assert_eq!(
-            password_to_index(&index_to_password(N - 1)).unwrap(),
-            N - 1
-        );
+        assert_eq!(password_to_index(&index_to_password(N - 1)).unwrap(), N - 1);
     }
 
     #[test]

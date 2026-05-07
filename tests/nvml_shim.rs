@@ -42,9 +42,7 @@ fn nvml_init_succeeds_when_so_available() {
                 .expect("device 0 debe existir si Nvml::init pasó");
             // Sanity: leer temperatura. Si esto falla, el driver no expone
             // la métrica (raro pero posible bajo WSL2).
-            let _ = dev.temperature(
-                nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu,
-            );
+            let _ = dev.temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu);
             eprintln!("Nvml::init OK — métricas GPU disponibles para la TUI");
         }
         Err(e) => {

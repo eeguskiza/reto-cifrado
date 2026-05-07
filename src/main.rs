@@ -1,8 +1,11 @@
-//! `quattro-crack` — CLI tras D-029.
+//! `quattro-crack` — CLI tras D-035 (cifraronline.com construction).
 //!
-//! El barrido tiene una **única configuración** (`md5hex_full /
-//! aes-256-ecb / pkcs7`), así que los flags `--preset`, `--kdf`, `--iv`,
-//! `--skip-config` y `--only-config` se eliminan.
+//! El barrido tiene una **única configuración** real verificada
+//! bit-exact contra pycryptodome: `passraw / aes-128-ecb / nullpad /
+//! md5verify`. La clave es `password.encode() + null pad` (sin MD5
+//! ni hexify). El integrity check del plaintext se valida en CPU
+//! comparando `MD5(plaintext_clean).hexdigest()` con los últimos 32
+//! chars del plaintext recuperado.
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -15,7 +18,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 
 use quattro_crack::ciphertext::{Ciphertext, CT_BLOCKS, TOTAL_BIN_LEN};
 use quattro_crack::combinatorics::N as N_TOTAL;
-use quattro_crack::cuda::{CudaCtx, KernelBundle, KernelBundleCoop};
+use quattro_crack::cuda::{CudaCtx, KernelBundle};
 use quattro_crack::gpu_metrics::GpuMonitor;
 use quattro_crack::plan::{Plan, PLAN_FORMAT_VERSION, SINGLE_PLAN_DESCRIPTION};
 use quattro_crack::runner::{self, ProgressSink, RunOptions, RunOutcome, StderrSink};
@@ -26,7 +29,7 @@ use quattro_crack::tui::{TuiSink, TuiSinkConfig};
 #[command(
     name = "quattro-crack",
     version,
-    about = "Brute-force CUDA contra AES-256-ECB + md5hex_full (D-029)"
+    about = "Brute-force CUDA contra AES-128-ECB + passraw (cifraronline.com, D-035)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,7 +45,7 @@ enum Cmd {
         path: PathBuf,
     },
 
-    /// Imprime el plan único de barrido (D-029).
+    /// Imprime el plan único de barrido (D-035).
     Plan {
         /// Ruta al fichero objetivo (para incluir su SHA-256 en el plan).
         #[arg(long, default_value = "./data/cifrado.txt")]
@@ -64,7 +67,7 @@ enum Cmd {
     },
 
     /// Ejecuta el barrido único. SIGINT/SIGTERM termina el batch en
-    /// curso, guarda el estado y sale. Ver D-025/D-026/D-029.
+    /// curso, guarda el estado y sale. Ver D-025/D-026/D-035.
     Run {
         /// Ruta al fichero base64 con el ciphertext.
         #[arg(long, default_value = "./data/cifrado.txt")]
@@ -108,7 +111,7 @@ enum Cmd {
         yes: bool,
     },
 
-    /// Mide throughput sostenido del kernel único (D-029) sobre un
+    /// Mide throughput sostenido del kernel único (D-035) sobre un
     /// ct_block_0 que no genera hits.
     ///
     /// Códigos de salida: 0 si ≥ 3 GH/s, 1 si 2 ≤ x < 3, 2 si < 2.
@@ -120,10 +123,6 @@ enum Cmd {
         /// Tamaño de cada batch lanzado al kernel.
         #[arg(long, default_value_t = 128 * 1024 * 1024)]
         batch_size: u64,
-
-        /// Usar el kernel COOPERATIVO intra-warp (D-030) en vez del legacy.
-        #[arg(long, default_value_t = false)]
-        coop: bool,
     },
 }
 
@@ -162,21 +161,25 @@ fn main() -> Result<()> {
         Cmd::Benchmark {
             duration,
             batch_size,
-            coop,
-        } => benchmark_cmd(duration, batch_size, coop),
+        } => benchmark_cmd(duration, batch_size),
     }
 }
 
 fn inspect(path: &Path) -> Result<()> {
     let ct = Ciphertext::load(path).with_context(|| format!("cargando {}", path.display()))?;
 
-    println!("file:         {}", ct.source_path.display());
+    println!("file:          {}", ct.source_path.display());
     println!(
-        "size:         {} B  ({} bloques AES-256-ECB de 16 B, sin IV)",
+        "size:          {} B  ({} bloques AES-128-ECB de 16 B, sin IV)",
         TOTAL_BIN_LEN, CT_BLOCKS
     );
-    println!("ct[0..32]:    {}", hex::encode(&ct.ct()[..32]));
-    println!("sha256(file): {}", hex::encode(ct.source_sha256));
+    println!("construction:  passraw / aes-128-ecb / nullpad / md5verify (D-035)");
+    println!("  key       =  password.encode() + null_pad to 16 B");
+    println!("  message   =  plaintext + MD5(plaintext).hexdigest()");
+    println!("  padded    =  message + null_pad to 16-byte boundary");
+    println!("  ct        =  AES-128-ECB.encrypt(padded, key)");
+    println!("ct[0..32]:     {}", hex::encode(&ct.ct()[..32]));
+    println!("sha256(file):  {}", hex::encode(ct.source_sha256));
     Ok(())
 }
 
@@ -191,7 +194,7 @@ fn plan_cmd(input: &Path, batch_size: u32, save: bool) -> Result<()> {
         batch_size,
     );
 
-    println!("plan         única configuración (D-029)");
+    println!("plan         única configuración (D-035)");
     println!("config       {SINGLE_PLAN_DESCRIPTION}");
     println!("source       {}", plan.source_path);
     println!("sha256       {}", plan.source_sha256);
@@ -219,9 +222,12 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let plan = load_plan(&plan_path)
-        .with_context(|| format!("leyendo {}", plan_path.display()))?;
-    println!("plan         {} (v{})", plan_path.display(), plan.program_version);
+    let plan = load_plan(&plan_path).with_context(|| format!("leyendo {}", plan_path.display()))?;
+    println!(
+        "plan         {} (v{})",
+        plan_path.display(),
+        plan.program_version
+    );
     println!("config       {SINGLE_PLAN_DESCRIPTION}");
     println!("source       {}", plan.source_path);
     println!("sha256       {}", plan.source_sha256);
@@ -241,8 +247,7 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
         if progress.prefix32_mismatch_count > 0 {
             println!(
                 "prefix32 mismatch    {} descartes (samples: idx={:?})",
-                progress.prefix32_mismatch_count,
-                progress.prefix32_mismatch_idx_samples
+                progress.prefix32_mismatch_count, progress.prefix32_mismatch_idx_samples
             );
         }
     } else {
@@ -336,10 +341,8 @@ fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {
     let progress_bak = state_dir.join("progress.toml.bak");
     let plan_bak = state_dir.join("plan.toml.bak");
 
-    let exists_any = plan_path.exists()
-        || progress_path.exists()
-        || progress_bak.exists()
-        || plan_bak.exists();
+    let exists_any =
+        plan_path.exists() || progress_path.exists() || progress_bak.exists() || plan_bak.exists();
     if !exists_any {
         println!("nada que borrar en {}.", state_dir.display());
         return Ok(());
@@ -372,44 +375,22 @@ fn reset_cmd(state_dir: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn benchmark_cmd(duration_secs: u64, batch_size: u64, coop: bool) -> Result<()> {
+fn benchmark_cmd(duration_secs: u64, batch_size: u64) -> Result<()> {
     let ctx = CudaCtx::init().context("CUDA init")?;
     let device = ctx.device_name().unwrap_or_else(|_| "<unknown>".into());
 
-    // Selección de kernel: D-030 cooperativo o legacy. La elección se
-    // resuelve con un enum interno para que el resto del código quede
-    // genérico sobre la API `launch(idx_base, idx_count, ct_block_0)`.
-    enum Bundle {
-        Legacy(KernelBundle),
-        Coop(KernelBundleCoop),
-    }
-    impl Bundle {
-        fn launch(&mut self, ib: u64, ic: u64, ct: &[u8; 16]) -> Result<()> {
-            match self {
-                Bundle::Legacy(b) => {
-                    b.launch(ib, ic, ct)?;
-                }
-                Bundle::Coop(b) => {
-                    b.launch(ib, ic, ct)?;
-                }
-            }
-            Ok(())
-        }
-    }
-
-    let mut bundle = if coop {
-        Bundle::Coop(KernelBundleCoop::load(&ctx).context("cargando kernel coop D-030")?)
-    } else {
-        Bundle::Legacy(KernelBundle::load(&ctx).context("cargando kernel legacy")?)
-    };
+    let mut bundle = KernelBundle::load(&ctx).context("cargando kernel D-035")?;
 
     // CT block aleatorio improbable de matchear "Leonardo da Vinc".
     let ct_block_0 = [0xffu8; 16];
 
     println!("device       : {device}");
-    println!("kernel       : {}", if coop { "D-030 cooperative intra-warp" } else { "legacy single-thread" });
+    println!("kernel       : D-035 passraw + AES-128-ECB single-thread");
     println!("config       : {SINGLE_PLAN_DESCRIPTION}");
-    println!("batch size   : {batch_size} ({:.2} Mi)", batch_size as f64 / (1u64 << 20) as f64);
+    println!(
+        "batch size   : {batch_size} ({:.2} Mi)",
+        batch_size as f64 / (1u64 << 20) as f64
+    );
     println!("duration tgt : {duration_secs}s");
     println!();
 

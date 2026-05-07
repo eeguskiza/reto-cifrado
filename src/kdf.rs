@@ -1,11 +1,17 @@
-//! KDF activa única: **md5hex_full**.
+//! KDFs históricas — TODAS legacy tras D-035.
 //!
-//! Tras D-029 el barrido usa una sola KDF: `MD5(pw_utf8).hexdigest().encode("ascii")`,
-//! que produce 32 bytes ASCII (clave AES-256). Esa es la función `derive_md5hex`.
+//! La construcción real (cifraronline.com) **no usa KDF**: la clave es
+//! `password.encode() + null pad` (ver [`crate::reference::build_key_passraw`]).
+//! Esto se descubrió experimentalmente cifrando un plaintext conocido en
+//! la web y comparando bit-exact contra el cipher local. Toda la
+//! suposición previa de D-029 (`MD5(pw).hexdigest()` como KDF AES-256)
+//! era incorrecta.
 //!
-//! Los 14 KDFs originales (Fase 2 + Fase 3.5) viven en el submódulo
-//! [`legacy`], que es **código auxiliar de tests** y no se expone vía
-//! CLI ni se ejecuta en el path activo del runner.
+//! `derive_md5hex` se mantiene `pub` pero queda como **función de tests
+//! legacy** (vectores reproducibles contra Python). El submódulo
+//! [`legacy`] sigue conteniendo las 14 KDFs históricas para los tests
+//! sintéticos y para reproducibilidad. Ninguna se ejecuta en el path
+//! activo.
 
 use md5::{Digest, Md5};
 
@@ -120,10 +126,7 @@ pub mod legacy {
                 | Self::Md5Trunc24
                 | Self::Md5Md5x2_24
                 | Self::Md5HexLo24 => 24,
-                Self::Md5Dup
-                | Self::Md5Md5Rev
-                | Self::Md5HexFull
-                | Self::EvpMd5Aes256Nosalt => 32,
+                Self::Md5Dup | Self::Md5Md5Rev | Self::Md5HexFull | Self::EvpMd5Aes256Nosalt => 32,
             }
         }
 
@@ -284,7 +287,8 @@ mod tests {
         let s = std::str::from_utf8(&key).unwrap();
         assert_eq!(s.len(), 32);
         assert!(
-            s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "esperaba hex lowercase, obtuve {s:?}"
         );
     }

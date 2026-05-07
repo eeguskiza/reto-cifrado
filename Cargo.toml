@@ -1,6 +1,6 @@
 [package]
 name = "quattro-crack"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Brute-force AES+MD5 cracker against a structured password space, CUDA-accelerated"

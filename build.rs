@@ -1,10 +1,12 @@
 //! build.rs — compila los kernels CUDA a PTX para `sm_120` (Blackwell)
 //! con fallback documentado a `sm_89` (Ada) si nvcc < 12.8.
 //!
-//! Tras D-029, **un único** PTX activo: `brute_md5hex_aes256_ecb.ptx`,
-//! sin parametrizar por KDF/KEY_LEN/MODE. El kernel parametrizado de
-//! Fase 3.5 (`brute.cu`, 14 PTX por KDF) se archiva como
-//! `brute_legacy_phase6.cu` y NO se compila.
+//! Tras D-035 (refactor a la construcción real cifraronline.com), el
+//! único PTX activo del barrido es `brute_passraw_aes128_ecb.ptx`. El
+//! kernel D-029 anterior (`brute_md5hex_aes256_ecb.cu`) se conserva
+//! como `brute_legacy_aes256.cu` (preservado, NO compilado) por si
+//! hace falta volver a comparar; el coop de D-030 también queda como
+//! archivo no compilado.
 //!
 //! Errores duros si nvcc falta. Cero "fallback silencioso a CPU" —
 //! cualquier fallo aquí rompe el build con mensaje accionable.
@@ -16,24 +18,23 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 /// Cabeceras compartidas — si cambia cualquiera, recompilar todo.
+/// `aes_coop.cuh` queda en árbol (legacy D-030) pero no se incluye aquí
+/// porque ningún source compilado lo usa.
 const SHARED_HEADERS: &[&str] = &[
     "kernels/gen.cuh",
     "kernels/md5.cuh",
     "kernels/aes.cuh",
     "kernels/aes_tables.cuh",
-    "kernels/aes_coop.cuh",
 ];
 
-/// Sources que producen PTX activos (D-029 + D-030).
+/// Sources que producen PTX activos (D-035).
 const KERNEL_SOURCES: &[&str] = &[
     "kernels/dump_passwords.cu",
     "kernels/md5_test.cu",
     "kernels/aes_test.cu",
     "kernels/force_emit_hits.cu",
     "kernels/dump_pt_block0.cu",
-    "kernels/brute_md5hex_aes256_ecb.cu",
-    "kernels/brute_md5hex_aes256_ecb_coop.cu",
-    "kernels/dump_pt_block0_coop.cu",
+    "kernels/brute_passraw_aes128_ecb.cu",
 ];
 
 fn main() -> Result<()> {
@@ -111,50 +112,20 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // PTX activo legacy del barrido (D-029).
-    let brute_src = Path::new("kernels/brute_md5hex_aes256_ecb.cu");
+    // PTX activo del barrido (D-035) — passraw + AES-128-ECB.
+    let brute_src = Path::new("kernels/brute_passraw_aes128_ecb.cu");
     if !brute_src.exists() {
-        bail!(
-            "kernels/brute_md5hex_aes256_ecb.cu no existe — refactor D-029 incompleto"
-        );
+        bail!("kernels/brute_passraw_aes128_ecb.cu no existe — refactor D-035 incompleto");
     }
     compile_ptx(
         &nvcc,
         &arch,
         brute_src,
         &[],
-        &out_dir.join("brute_md5hex_aes256_ecb.ptx"),
+        &out_dir.join("brute_passraw_aes128_ecb.ptx"),
         &profile,
     )
-    .context("compilando brute_md5hex_aes256_ecb.cu")?;
-
-    // PTX cooperativo intra-warp (D-030).
-    let brute_coop_src = Path::new("kernels/brute_md5hex_aes256_ecb_coop.cu");
-    if brute_coop_src.exists() {
-        compile_ptx(
-            &nvcc,
-            &arch,
-            brute_coop_src,
-            &[],
-            &out_dir.join("brute_md5hex_aes256_ecb_coop.ptx"),
-            &profile,
-        )
-        .context("compilando brute_md5hex_aes256_ecb_coop.cu")?;
-    }
-
-    // PTX dump cooperativo (paridad bit-exact a 1M idx).
-    let dump_coop_src = Path::new("kernels/dump_pt_block0_coop.cu");
-    if dump_coop_src.exists() {
-        compile_ptx(
-            &nvcc,
-            &arch,
-            dump_coop_src,
-            &[],
-            &out_dir.join("dump_pt_block0_coop.ptx"),
-            &profile,
-        )
-        .context("compilando dump_pt_block0_coop.cu")?;
-    }
+    .context("compilando brute_passraw_aes128_ecb.cu")?;
 
     Ok(())
 }
@@ -196,7 +167,9 @@ fn find_nvcc() -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    Err(anyhow!("nvcc no encontrado en NVCC, CUDA_HOME, PATH, ni rutas conocidas"))
+    Err(anyhow!(
+        "nvcc no encontrado en NVCC, CUDA_HOME, PATH, ni rutas conocidas"
+    ))
 }
 
 fn pick_arch(nvcc: &Path) -> Result<String> {

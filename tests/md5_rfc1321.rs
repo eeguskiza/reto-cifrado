@@ -7,7 +7,10 @@ const VECTORS: &[(&[u8], &str)] = &[
     (b"a", "0cc175b9c0f1b6a831c399e269772661"),
     (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
     (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
-    (b"abcdefghijklmnopqrstuvwxyz", "c3fcd3d76192e4007dfb496cca67e13b"),
+    (
+        b"abcdefghijklmnopqrstuvwxyz",
+        "c3fcd3d76192e4007dfb496cca67e13b",
+    ),
     (
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
         "d174ab98d277d9f5a5611c2c9f419d9f",
@@ -37,7 +40,8 @@ fn test_md5_rfc1321_device() {
     for (i, (msg, expected)) in VECTORS.iter().enumerate() {
         let got = hex::encode(&digests[i * 16..(i + 1) * 16]);
         assert_eq!(
-            &got, expected,
+            &got,
+            expected,
             "MD5 device discrepa con RFC 1321 para input len={}",
             msg.len()
         );

@@ -1485,3 +1485,228 @@ Cualquier evento que en teoría no debería ocurrir (probabilidad
 ~2⁻¹²⁸) merece `info!` o superior, no `debug!`. Si nunca ocurre, no
 ensucia el log; si ocurre, queda trazado. Los contadores persistentes
 en el state cubren el caso de proceso que muere antes del análisis.
+
+## D-035 — La construcción REAL es cifraronline.com: passraw + AES-128-ECB + null pad + MD5 verify
+
+### Contexto
+
+El barrido completo D-029 (8 h, 100 % del espacio, 0 hits confirmados,
+0 prefix32 mismatches en producción tras D-034) confirmó que la
+construcción asumida era incorrecta. El autor del reto reveló que
+había usado **cifraronline.com** ("AES, ECB, MD5") como herramienta
+de cifrado.
+
+El usuario hizo entonces una **prueba experimental controlada**: cifró
+en la web un plaintext y password conocidos, descargó el ciphertext
+resultante, e intentó reconstruirlo localmente probando hipótesis. El
+resultado descartó **todas** las suposiciones previas:
+
+- ❌ AES-256: era AES-128.
+- ❌ KDF `MD5(pw).hexdigest()` 32 B: la clave es directamente
+  `password.encode() + null pad`. **NO hay KDF.**
+- ❌ PKCS7: el padding es **NULL** (`b'\x00' * (16 - len % 16)`).
+- ❌ MD5 del password como clave: el "Hash: MD5" de la web se refiere
+  al MD5 del **plaintext** que se concatena al final como integrity
+  check, NO a la KDF.
+
+### Construcción real (verificada bit-exact contra pycryptodome)
+
+```python
+key       = password.encode() + b'\x00' * (16 - len(password.encode()))
+message   = plaintext_bytes + MD5(plaintext_bytes).hexdigest().encode()
+padded    = message + b'\x00' * ((16 - len(message) % 16) % 16)
+ciphertext = AES-128-ECB.encrypt(padded, key)
+```
+
+### Vector experimental (test bloqueante)
+
+```
+password           = ".aAaaeeii1452."
+plaintext          = b"Leonardo da Vinci\n\nLeonardo da Vinci es muy crack 1452."
+MD5(plaintext)     = bcba8e3f8c64e5aa7b0546f807138f23
+key                = 2e6141616165656969313435322e0000     (hex, 16 B)
+expected_ct (b64)  = ZiJtruxqeLYBXsv4QD3P28g46sarTVak+glc8e7BuBupNdO0K8As740YJcA72ODOW5+IZMguNS17p5cs8BUi1Zs2AFhY3iGn6CcEvvhkXbh+jlAMAhEHNC/6e12UGoIO
+```
+
+`tests/d035_cifraronline_construction.rs::test_experimental_vector_bit_exact`
+verifica los 5 pasos: MD5 del plaintext, layout de la key, longitud
+del padded message (87 + 9 nulls = 96 B = 6 bloques), ciphertext
+bit-exact con `aes` crate (RustCrypto, equivalente a pycryptodome) y
+round-trip. Si este test falla, todo lo demás está mal.
+
+### Por qué el reto encaja con 1616 B exactos
+
+La biografía de Leonardo (≈1552 chars en español con tildes/ñ → ~1584
+B en UTF-8) + 32 B de MD5 hex = **1616 B exactos**, que es el tamaño
+del fichero `data/cifrado.txt` decodificado. Por eso no había null
+padding visible: el message ya alineaba a 16 B. Cuadra perfecto.
+
+### Salto de línea: incertidumbre LF/CRLF
+
+El plaintext arranca con `Leonardo da Vinci`, salto, `Leonardo da Vinci es muy crack <año>...`.
+El salto es ambiguo:
+
+- **Pizarra del autor**: dice `\r\n\r\n` (línea en blanco intermedia).
+- **Notepad de Windows**: barra de estado muestra "Windows (CRLF)".
+- **Prueba experimental desde el navegador del usuario**: dio `\n`
+  simple (la web aplica conversión LF → ?).
+
+El kernel solo valida los primeros 16 B (`Leonardo da Vinc`), idénticos
+en ambas hipótesis. La validación CPU prueba **las dos variantes**:
+
+```rust
+KNOWN_PREFIX_32_LF   = b"Leonardo da Vinci\n\nLeonardo da V";       // 17 + 2 + 13 = 32
+KNOWN_PREFIX_32_CRLF = b"Leonardo da Vinci\r\n\r\nLeonardo da";     // 17 + 4 + 11 = 32
+```
+
+`HitVerdict::Confirmed` lleva `LineEnding::Lf | Crlf` para auditoría.
+
+### Cambios al modelo
+
+#### CUDA
+
+- **Nuevo kernel activo**: `kernels/brute_passraw_aes128_ecb.cu` con
+  `__launch_bounds__(128, 8)`. Sin MD5 ni hexify en hot path. ptxas
+  reporta **64 regs/thread, 0 spill, 4624 B smem**. Cabe 8 blocks/SM
+  (vs 6 del D-029) → 1024 threads/SM ≈ 67 % occupancy.
+- **Kernel D-029 archivado**: `kernels/brute_md5hex_aes256_ecb.cu`
+  renombrado a `kernels/brute_legacy_aes256.cu`. NO se compila.
+- **Coop kernel D-030**: queda en árbol como archival, NO se compila.
+  `KernelBundleCoop` y `gpu_dump_pt_block0_coop` removidos del API
+  público de `cuda.rs`.
+- **Dump kernel** (`dump_pt_block0.cu`) reescrito con la nueva
+  construcción para que tests de paridad sigan funcionando.
+
+#### CPU (`src/reference.rs`)
+
+- **Path activo nuevo**: `decrypt_aes128_ecb_raw`,
+  `encrypt_aes128_ecb`, `encrypt_cifraronline`, `build_key_passraw`,
+  `build_message`, `null_pad_to_block`.
+- **`HitVerdict` rediseñado**:
+  - `Confirmed { plaintext, line_ending }` (nuevo campo).
+  - `PrefixMismatch32 { plaintext_first_32 }` (igual semántica que
+    D-034, pero ahora se considera mismatch si NI LF ni CRLF
+    matchean).
+  - `Md5MismatchCritical { plaintext, embedded_md5_hex,
+    computed_md5_hex, line_ending }` reemplaza al viejo
+    `Pkcs7Mismatch`. Mismo significado: prefijo-32 OK pero integrity
+    falla → ~2⁻¹²⁸ por azar → casi seguro un bug, abortar.
+- Helpers legacy `decrypt_ecb_raw` (AES-256, D-029) y
+  `decrypt_cbc_raw` siguen `pub` con `#[doc(hidden)]` para que tests
+  legacy puedan generar fixtures sintéticos.
+
+#### Plan / state / CLI
+
+- `program_version` sube de **0.2.0 → 1.0.0**. `same_major()` rechaza
+  el resume cross-major; los planes/states pre-D-035 quedan
+  inservibles (la construcción cambió). El usuario debe ejecutar
+  `quattro-crack reset --yes` antes del nuevo run.
+- `SINGLE_PLAN_DESCRIPTION = "passraw / aes-128-ecb / nullpad / md5verify"`.
+- `quattro-crack inspect` reporta la nueva construcción línea a línea.
+- `quattro-crack benchmark` sin flag `--coop` (eliminado).
+
+#### Eventos del runner (`src/runner.rs`)
+
+- `HitConfirmed` lleva `LineEnding`.
+- `HitCriticalPkcs7Mismatch` → renombrado `HitCriticalMd5Mismatch`
+  con campos `embedded_md5_hex`, `computed_md5_hex`, `line_ending`.
+
+### Throughput medido (post-D-035)
+
+RTX 5070 Ti, sm_120, batch 128 Mi, 30 s de benchmark:
+
+| Métrica            | D-029 (AES-256 + md5hex) | D-035 (passraw + AES-128) |
+|--------------------|--------------------------|---------------------------|
+| avg GH/s           | 1.486                    | **4.347**                 |
+| peak GH/s          | 1.821                    | **5.630**                 |
+| median GH/s        | 1.417                    | **4.296**                 |
+| regs/thread        | 80 + 84 B spill          | **64, 0 spill**           |
+| occupancy nominal  | 33 %                     | **67 %**                  |
+
+**Speedup ≈ 2.9× avg / 3.1× peak** sobre D-029. Justificación:
+
+1. **Eliminación del KDF en hot path**: `MD5(pw)+hexify` representaba
+   ~60 % del coste por candidata bajo D-029 (D-030 §"Por qué pierde").
+   En D-035, key se construye con un memcpy de 14 B + 2 zeros — coste
+   despreciable.
+2. **AES-128 vs AES-256**: 10 rondas vs 14 (-29 %), rk[44] vs rk[60]
+   (-27 % mem). Sumado, ~-25 % de coste por decrypt.
+3. **Cero spill**: D-029 tenía 84 B spill stores por la presión de
+   rk[60] con (128, 6). D-035 con (128, 8) cabe en 64 regs/thread sin
+   spill, mejorando además la occupancy.
+
+### ETA del barrido completo
+
+```
+N = 59 559 806 250 000
+4.347 GH/s avg → 13 702 s ≈ 3 h 48 min
+5.630 GH/s peak → 10 580 s ≈ 2 h 56 min
+```
+
+Comparado con las 11.2 h de D-029, el barrido cabe ahora en una
+sola sesión nocturna con margen.
+
+### Si no encuentra hit
+
+Si el barrido completa sin hit confirmado:
+
+1. Revisar contadores `prefix32_mismatch_count` en `state/progress.toml`
+   y los logs `info!` con `plaintext_first_32_hex`. Si hay descartes,
+   alguna hipótesis del reto es falsa (probablemente otro layout de
+   prefijo-32 distinto de LF/CRLF).
+2. Probar otros saltos de línea (`\r` solo, sin separación, etc.) —
+   añadir más `KNOWN_PREFIX_32_*` y reanudar.
+3. Comprobar el espacio combinatorio (¿el password tiene exactamente
+   14 chars? ¿o el formato `.LLLLLLLL1NNN.` es incorrecto?).
+4. Reconfirmar la construcción cifrando el mismo plaintext del autor
+   (cuando se pueda) y comparando con `data/cifrado.txt`.
+
+### Tests añadidos (`tests/d035_cifraronline_construction.rs`)
+
+9 tests verdes:
+
+1. `test_kdf_is_passraw_with_null_padding` — la "KDF" es trivial.
+2. `test_experimental_vector_bit_exact` — el vector experimental
+   bit-exact (ANCLA: si falla, todo el refactor es inservible).
+3. `test_aes128_kernel_matches_pycryptodome_ecb` — kernel CUDA bit-exact
+   contra reference CPU sobre 1 M idx (5 chunks de 200 K en distintas
+   posiciones del espacio).
+4. `test_validate_hit_lf_variant` — kernel + CPU encuentran hit con
+   plaintext LF.
+5. `test_validate_hit_crlf_variant` — idem con CRLF.
+6. `test_md5_mismatch_critical_aborts` — corrompe el MD5 del plaintext
+   sintético, verifica que el runner aborta con `Md5MismatchCritical`
+   y persiste estado.
+7. `test_full_pipeline_on_synthetic_corpus` — 16 idx (boundaries +
+   random), cada uno encuentra su hit y CPU confirma.
+8. `test_cli_inspect_reports_new_construction` — `quattro-crack
+   inspect` describe `passraw / aes-128 / nullpad / md5verify`.
+9. `test_kernel_prefix_16_valid_for_both_line_endings` — sanity de
+   que las dos variantes de prefijo-32 comparten los primeros 16 B.
+
+Otros tests adaptados: `tests/d034_prefix32_fix.rs` (dual prefix
+LF/CRLF), `tests/optimized_kernel_parity.rs` (baseline AES-128),
+`tests/e2e_synthetic.rs`, `tests/runner_throughput.rs`,
+`tests/throughput_diagnosis.rs`, `tests/tui.rs`, `tests/resume.rs`,
+`tests/block4_adversarial.rs`. Eliminados (obsoletos por construcción):
+`tests/coop_kernel_parity.rs`, `tests/d029_single_config.rs`. KDF
+catalog tests (`tests/kdf.rs`, `tests/legacy_kdf.rs`) intactos como
+documentación reproducible de las KDFs históricas.
+
+### Métricas finales tras D-035
+
+- **105 tests verdes + 10 ignorados** (sube de 99 verdes a 105 por
+  los 9 nuevos D-035 menos los 5 borrados de coop + d029).
+- **Clippy `-D warnings` limpio**.
+- **Throughput ≈ 2.9× sobre D-029** (4.35 GH/s avg vs 1.49).
+- **State legacy borrado** (`quattro-crack reset --yes`); el usuario
+  arranca el nuevo barrido desde idx 0.
+- **ETA ≈ 3.8 h** para barrer las 5.96 × 10¹³ candidatas.
+
+### Lección
+
+Las pruebas experimentales valen más que cualquier deducción de
+documentación. Antes de invertir 8 h de GPU en un barrido, **cifra un
+plaintext conocido con el password trivial y compara bit-exact contra
+tu cipher local**. Lo barato vs lo caro. El refactor de hoy fue 100 %
+prevenible si hubiéramos hecho esa prueba el día 1.

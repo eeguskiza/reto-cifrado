@@ -1,4 +1,4 @@
-//! Tests Fase 5 + adaptados a D-029.
+//! Tests Fase 5 + adaptados a D-035.
 
 use std::io::Write;
 use std::path::Path;
@@ -10,24 +10,27 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use tempfile::TempDir;
 
-use quattro_crack::kdf::derive_md5hex;
-use quattro_crack::reference::{encrypt_ecb_pkcs7, KNOWN_PREFIX_32};
+use quattro_crack::ciphertext::TOTAL_BIN_LEN;
+use quattro_crack::reference::{
+    build_key_passraw, encrypt_cifraronline, LineEnding, KNOWN_PREFIX_32_LF,
+};
 use quattro_crack::runner::{ProgressEvent, ProgressSink, StderrSink};
 use quattro_crack::tui::{TuiSink, TuiSinkConfig};
 
 const QC_BIN: &str = env!("CARGO_BIN_EXE_quattro-crack");
 
-fn build_pt_1600() -> Vec<u8> {
-    let mut pt = Vec::with_capacity(1600);
-    pt.extend_from_slice(KNOWN_PREFIX_32);
-    while pt.len() < 1600 {
+fn build_pt_for_1616_ct() -> Vec<u8> {
+    let mut pt = Vec::with_capacity(1584);
+    pt.extend_from_slice(KNOWN_PREFIX_32_LF);
+    while pt.len() < 1584 {
         pt.push(b'X');
     }
+    pt.truncate(1584);
     pt
 }
 
-fn write_cifrado_ecb(path: &Path, ct_1616: &[u8]) {
-    assert_eq!(ct_1616.len(), 1616);
+fn write_cifrado_d035(path: &Path, ct_1616: &[u8]) {
+    assert_eq!(ct_1616.len(), TOTAL_BIN_LEN);
     std::fs::write(path, STANDARD.encode(ct_1616)).unwrap();
 }
 
@@ -35,15 +38,15 @@ fn write_cifrado_ecb(path: &Path, ct_1616: &[u8]) {
 fn test_stderr_sink_emits_phase4_compatible_format() {
     // Setup: target_idx muy bajo para que el run termine rápido.
     let pw = b".aAaabbbb1000.";
-    let key = derive_md5hex(pw);
-    let pt = build_pt_1600();
-    let ct = encrypt_ecb_pkcs7(&key, &pt);
+    let key = build_key_passraw(pw);
+    let pt = build_pt_for_1616_ct();
+    let ct = encrypt_cifraronline(&key, &pt);
 
     let tmp = TempDir::new().unwrap();
     let input_path = tmp.path().join("cifrado.txt");
     let state_dir = tmp.path().join("state");
     let log_dir = tmp.path().join("logs");
-    write_cifrado_ecb(&input_path, &ct);
+    write_cifrado_d035(&input_path, &ct);
 
     let output = Command::new(QC_BIN)
         .args([
@@ -62,14 +65,20 @@ fn test_stderr_sink_emits_phase4_compatible_format() {
         ])
         .output()
         .expect("spawn run --no-tui");
-    assert!(output.status.success(), "run debería terminar limpio: {output:?}");
+    assert!(
+        output.status.success(),
+        "run debería terminar limpio: {output:?}"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("device:"), "header device: ausente:\n{stderr}");
+    assert!(
+        stderr.contains("device:"),
+        "header device: ausente:\n{stderr}"
+    );
     assert!(stderr.contains("plan:"), "header plan: ausente");
     assert!(
-        stderr.contains("md5hex_full"),
-        "no aparece la única config (md5hex_full):\n{stderr}"
+        stderr.contains("passraw") || stderr.contains("aes-128-ecb"),
+        "no aparece la nueva config (passraw / aes-128-ecb):\n{stderr}"
     );
     assert!(
         stderr.contains("HIT CONFIRMADO") || stderr.contains("plan completado"),
@@ -108,14 +117,14 @@ fn capture_with_stderr_sink(events: &[ProgressEvent]) -> String {
 }
 
 #[test]
-fn test_progress_events_serialize_after_d029() {
+fn test_progress_events_serialize_after_d035() {
     let events: Vec<ProgressEvent> = vec![
         ProgressEvent::PlanLoaded {
             total_candidates: 1_000_000,
             source_sha256: "deadbeef".into(),
             batch_size: 1024,
             device_name: "GPU".into(),
-            config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
+            config_id: "passraw / aes-128-ecb / nullpad / md5verify".into(),
         },
         ProgressEvent::Resumed { from_step: 100 },
         ProgressEvent::ResumeRejected { reason: "x".into() },
@@ -132,17 +141,23 @@ fn test_progress_events_serialize_after_d029() {
             temperature_c: 60,
             power_w: 200,
         },
-        ProgressEvent::GpuMetricsUnavailable { reason: "test".into() },
+        ProgressEvent::GpuMetricsUnavailable {
+            reason: "test".into(),
+        },
         ProgressEvent::HitConfirmed {
             password: "x".into(),
             idx: 1,
             plaintext_hex_first_32: "ab".into(),
+            line_ending: LineEnding::Lf,
             elapsed_total: Duration::from_secs(1),
         },
         ProgressEvent::HitDiscardedPrefixMismatch { idx: 1 },
-        ProgressEvent::HitCriticalPkcs7Mismatch {
+        ProgressEvent::HitCriticalMd5Mismatch {
             idx: 1,
             password: "x".into(),
+            line_ending: LineEnding::Crlf,
+            embedded_md5_hex: "0".repeat(32),
+            computed_md5_hex: "f".repeat(32),
         },
         ProgressEvent::Paused {
             last_step: 1,
@@ -160,14 +175,14 @@ fn test_progress_events_serialize_after_d029() {
 
     let out = capture_with_stderr_sink(&events);
     assert!(out.contains("device:"));
-    assert!(out.contains("md5hex_full"));
+    assert!(out.contains("passraw") || out.contains("aes-128"));
 }
 
 #[test]
 fn test_tui_sink_does_not_panic_on_missing_nvml() {
     let mut sink = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.2.0".into(),
+        project_version: "1.0.0".into(),
     });
     sink.on_event(ProgressEvent::GpuMetricsUnavailable {
         reason: "Nvml::init falló: test".into(),
@@ -177,7 +192,7 @@ fn test_tui_sink_does_not_panic_on_missing_nvml() {
         source_sha256: "00".into(),
         batch_size: 1024,
         device_name: "test".into(),
-        config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
+        config_id: "passraw / aes-128-ecb / nullpad / md5verify".into(),
     });
     sink.on_event(ProgressEvent::PlanCompleted {
         total_hits: 0,
@@ -193,14 +208,14 @@ fn test_tui_sink_does_not_panic_on_missing_nvml() {
 fn test_tui_completes_on_plan_completed_event() {
     let mut sink = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.2.0".into(),
+        project_version: "1.0.0".into(),
     });
     sink.on_event(ProgressEvent::PlanLoaded {
         total_candidates: 1_000_000,
         source_sha256: "00".into(),
         batch_size: 1,
         device_name: "test".into(),
-        config_id: "md5hex_full / aes-256-ecb / pkcs7".into(),
+        config_id: "passraw / aes-128-ecb / nullpad / md5verify".into(),
     });
     sink.on_event(ProgressEvent::PlanCompleted {
         total_hits: 0,
@@ -210,7 +225,7 @@ fn test_tui_completes_on_plan_completed_event() {
 
     let mut sink2 = TuiSink::new(TuiSinkConfig {
         n_total_candidates: 1_000_000,
-        project_version: "0.2.0".into(),
+        project_version: "1.0.0".into(),
     });
     sink2.on_event(ProgressEvent::Paused {
         last_step: 100,

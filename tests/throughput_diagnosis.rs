@@ -1,4 +1,4 @@
-//! Diagnóstico Fase 7 + adaptado a D-029. Tests `#[ignore]` (CUDA + I/O
+//! Diagnóstico Fase 7 + adaptado a D-035. Tests `#[ignore]` (CUDA + I/O
 //! reales). Invocar con:
 //!
 //!     cargo test --release --test throughput_diagnosis -- \
@@ -13,9 +13,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use tempfile::TempDir;
 
+use quattro_crack::ciphertext::TOTAL_BIN_LEN;
 use quattro_crack::cuda::{CudaCtx, KernelBundle};
-use quattro_crack::kdf::derive_md5hex;
-use quattro_crack::reference::{encrypt_ecb_pkcs7, KNOWN_PREFIX_32};
+use quattro_crack::reference::{build_key_passraw, encrypt_cifraronline, KNOWN_PREFIX_32_LF};
 use quattro_crack::runner::{self, ProgressEvent, ProgressSink, RunOptions, RunOutcome};
 use quattro_crack::state::{save_progress_with_bak, Progress};
 
@@ -43,20 +43,22 @@ impl ProgressSink for CountingSink {
     }
 }
 
-fn build_plaintext_1600() -> Vec<u8> {
-    let mut pt = Vec::with_capacity(1600);
-    pt.extend_from_slice(KNOWN_PREFIX_32);
-    while pt.len() < 1600 {
+fn build_plaintext_for_1616() -> Vec<u8> {
+    let mut pt = Vec::with_capacity(1584);
+    pt.extend_from_slice(KNOWN_PREFIX_32_LF);
+    while pt.len() < 1584 {
         pt.push(b'X');
     }
+    pt.truncate(1584);
     pt
 }
 
 fn write_synthetic_cifrado(path: &Path) {
     let pw = b".aAabbabb1999.";
-    let key = derive_md5hex(pw);
-    let pt = build_plaintext_1600();
-    let ct = encrypt_ecb_pkcs7(&key, &pt);
+    let key = build_key_passraw(pw);
+    let pt = build_plaintext_for_1616();
+    let ct = encrypt_cifraronline(&key, &pt);
+    assert_eq!(ct.len(), TOTAL_BIN_LEN);
     let b64 = STANDARD.encode(&ct);
     std::fs::write(path, b64).unwrap();
 }
@@ -103,7 +105,7 @@ fn diagnose_kernel_only(batch_size: u64) {
     let elapsed = started.elapsed();
     let ghs = total as f64 / elapsed.as_secs_f64() / 1.0e9;
     eprintln!(
-        "kernel-only  batch={:>4.0} Mi  total={:>12} cands  elapsed={:>6.2?}s  GH/s={:.3}",
+        "kernel-only D-035  batch={:>4.0} Mi  total={:>12} cands  elapsed={:>6.2?}s  GH/s={:.3}",
         batch_size as f64 / (1u64 << 20) as f64,
         total,
         elapsed,
@@ -163,7 +165,7 @@ fn diagnose_runner_throughput(batch_size: u32, flush_every: u32, secs: u64) {
     let total = batches * batch_size as u64;
     let ghs = total as f64 / elapsed.as_secs_f64() / 1.0e9;
     eprintln!(
-        "runner       batch={:>4.0} Mi  flush={:>2}  batches={:>5}  total={:>12}  elapsed={:>6.2?}s  GH/s={:.3}  outcome={}",
+        "runner D-035  batch={:>4.0} Mi  flush={:>2}  batches={:>5}  total={:>12}  elapsed={:>6.2?}s  GH/s={:.3}  outcome={}",
         batch_size as f64 / (1u64 << 20) as f64,
         flush_every,
         batches,

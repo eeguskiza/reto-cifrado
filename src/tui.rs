@@ -104,11 +104,9 @@ struct Bars {
 fn build_bars(mp: &MultiProgress, total_configs: u64, n_total: u64) -> Bars {
     let line = ProgressStyle::with_template("{prefix:<8.bold} {msg}")
         .unwrap_or_else(|_| ProgressStyle::default_bar());
-    let bar32 = ProgressStyle::with_template(
-        "{prefix:<8.bold} {bar:32.cyan/blue}  {msg}",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("█░");
+    let bar32 = ProgressStyle::with_template("{prefix:<8.bold} {bar:32.cyan/blue}  {msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("█░");
 
     let plan = mp.add(ProgressBar::new(total_configs.max(1)));
     plan.set_prefix("[Plan]");
@@ -214,7 +212,7 @@ fn run_renderer(rx: Receiver<ProgressEvent>, cfg: TuiSinkConfig) {
 
     // Cabecera estática.
     let _ = mp.println(format!(
-        "quattro-crack v{} — N = {} — AES-256-ECB (PKCS7), md5hex_full",
+        "quattro-crack v{} — N = {} — AES-128-ECB passraw + MD5 verify (D-035)",
         cfg.project_version, cfg.n_total_candidates
     ));
 
@@ -269,8 +267,9 @@ fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiPro
             st.started_at = Some(Instant::now());
             st.cfg_started_at = Some(Instant::now());
             bars.plan.set_length(1);
-            bars.plan.set_message("0/1 configurations  ·  D-029 single");
-            bars.config_line.set_message(config_id.clone() + "  ·  AES-256");
+            bars.plan.set_message("0/1 configurations  ·  D-035 single");
+            bars.config_line
+                .set_message(config_id.clone() + "  ·  AES-128");
             bars.space.set_length(total_candidates);
             let _ = mp.println(format!(
                 "device: {device_name}  ·  batch_size: {batch_size}  ·  config: {config_id}"
@@ -385,12 +384,14 @@ fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiPro
         }
         ProgressEvent::GpuMetricsUnavailable { reason } => {
             st.gpu_unavailable = true;
-            bars.gpu_line.set_message(format!("metrics unavailable ({reason})"));
+            bars.gpu_line
+                .set_message(format!("metrics unavailable ({reason})"));
         }
         ProgressEvent::HitConfirmed {
             password,
             idx,
             plaintext_hex_first_32,
+            line_ending,
             elapsed_total,
         } => {
             st.hits += 1;
@@ -398,9 +399,10 @@ fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiPro
                 .set_message(format!("Hits found: {}", st.hits));
             let _ = mp.println(format!(
                 "================================================================\n\
-                 ★ HIT  idx={idx}  pw='{password}'  elapsed={:.2}s\n\
+                 ★ HIT  idx={idx}  pw='{password}'  line_ending={}  elapsed={:.2}s\n\
                  plaintext[..32]={plaintext_hex_first_32}\n\
                  ================================================================",
+                line_ending.as_str(),
                 elapsed_total.as_secs_f64()
             ));
             st.finished = true;
@@ -410,16 +412,29 @@ fn handle_event(event: ProgressEvent, st: &mut State, bars: &Bars, mp: &MultiPro
                 "Last sample (idx={idx}):  (kernel false positive, prefix32 ≠ Leonardo da Vinc)"
             ));
         }
-        ProgressEvent::HitCriticalPkcs7Mismatch { idx, password } => {
+        ProgressEvent::HitCriticalMd5Mismatch {
+            idx,
+            password,
+            line_ending,
+            embedded_md5_hex,
+            computed_md5_hex,
+        } => {
             let _ = mp.println(format!(
                 "================================================================\n\
-                 CRITICAL: prefijo-32 OK pero PKCS7 INVÁLIDO  idx={idx} pw='{password}'\n\
+                 CRITICAL: prefijo-32 ({}) OK pero MD5 INTEGRITY MISMATCH  \
+                 idx={idx} pw='{password}'\n  \
+                 embedded MD5(hex): {embedded_md5_hex}\n  \
+                 computed MD5(hex): {computed_md5_hex}\n\
                  ABORTANDO el barrido. Estado guardado para inspección.\n\
-                 ================================================================"
+                 ================================================================",
+                line_ending.as_str()
             ));
             st.finished = true;
         }
-        ProgressEvent::Paused { last_step, elapsed_total } => {
+        ProgressEvent::Paused {
+            last_step,
+            elapsed_total,
+        } => {
             let _ = mp.println(format!(
                 "================================================================\n\
                  [PAUSED]  elapsed={:.2}s  last_step={}\n\

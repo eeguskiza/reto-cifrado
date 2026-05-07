@@ -106,7 +106,9 @@ impl Progress {
 
 /// Escribe `bytes` a `path` de forma atómica (write-tmp-fsync-rename).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    let parent = path.parent().ok_or_else(|| StateError::NoParent(path.into()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| StateError::NoParent(path.into()))?;
     fs::create_dir_all(parent)?;
 
     let new_path = sidecar_new(path);
@@ -314,7 +316,10 @@ mod tests {
         p2.next_step = 200;
         save_progress_with_bak(&path, &p2).unwrap();
         assert!(path.exists());
-        assert!(bak.exists(), "segundo flush DEBE haber rotado el primero a .bak");
+        assert!(
+            bak.exists(),
+            "segundo flush DEBE haber rotado el primero a .bak"
+        );
 
         let main = load_progress(&path).unwrap();
         assert_eq!(main.next_step, 200);

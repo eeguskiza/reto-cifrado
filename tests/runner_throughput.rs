@@ -1,8 +1,10 @@
-//! Tests bloqueantes Fase 7 + adaptados a D-029.
+//! Tests bloqueantes Fase 7 + adaptados a D-035.
 //!
-//! 1. Throughput end-to-end del runner con la única configuración.
-//! 2. Compatibilidad de fixtures: el `progress.toml` legacy de la sesión
-//!    pre-D-029 (idx 30 T sobre CBC) debe ser RECHAZADO con error claro.
+//! 1. Throughput end-to-end del runner con la única configuración
+//!    real (passraw + AES-128).
+//! 2. Compatibilidad de fixtures: el `progress.toml` legacy de la
+//!    sesión pre-D-029 (CBC, multi-config) debe ser RECHAZADO con
+//!    error claro.
 //! 3. Reanudación correcta entre flushes agrupados.
 
 use std::path::Path;
@@ -14,12 +16,10 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use tempfile::TempDir;
 
-use quattro_crack::kdf::derive_md5hex;
-use quattro_crack::reference::{encrypt_ecb_pkcs7, KNOWN_PREFIX_32};
+use quattro_crack::ciphertext::TOTAL_BIN_LEN;
+use quattro_crack::reference::{build_key_passraw, encrypt_cifraronline, KNOWN_PREFIX_32_LF};
 use quattro_crack::runner::{self, ProgressEvent, ProgressSink, RunOptions, RunOutcome};
-use quattro_crack::state::{
-    load_progress_with_bak, save_progress_with_bak, Progress, StateError,
-};
+use quattro_crack::state::{load_progress_with_bak, save_progress_with_bak, Progress, StateError};
 
 struct CountingSink {
     batches: AtomicU64,
@@ -44,29 +44,39 @@ impl ProgressSink for CountingSink {
     }
 }
 
-fn build_plaintext_1600() -> Vec<u8> {
-    let mut pt = Vec::with_capacity(1600);
-    pt.extend_from_slice(KNOWN_PREFIX_32);
-    while pt.len() < 1600 {
+/// Construye un plaintext sintético que arranca con KNOWN_PREFIX_32_LF
+/// y se rellena hasta cubrir 1616 B de ciphertext final (formato real
+/// del fichero objetivo).
+fn build_plaintext_for_1616_ct() -> Vec<u8> {
+    // Ciphertext de 1616 B = 101 bloques. message debe terminar con
+    // null pad de longitud (16 - len(message) % 16) % 16, y len(ct) =
+    // len(padded). Para que ct = 1616, padded = 1616, message ≤ 1616 con
+    // longitud que tras padding == 1616. Si message es múltiplo de 16,
+    // padded == message. Más simple: message = 1616 - 32 (md5_hex) = 1584
+    // B de plaintext_clean. Luego padded = 1616 exact.
+    let mut pt = Vec::with_capacity(1584);
+    pt.extend_from_slice(KNOWN_PREFIX_32_LF);
+    while pt.len() < 1584 {
         pt.push(b'X');
     }
+    pt.truncate(1584);
     pt
 }
 
-/// Cifra un PT bajo md5hex_full / AES-256-ECB con una clave que NO está
+/// Cifra un PT bajo passraw / AES-128-ECB con una clave que NO está
 /// en el rango barrido — el runner barrerá sin encontrar nada.
 fn write_synthetic_cifrado(path: &Path) {
     let pw = b".aAabbabb1999.";
-    let key = derive_md5hex(pw);
-    let pt = build_plaintext_1600();
-    let ct = encrypt_ecb_pkcs7(&key, &pt);
-    assert_eq!(ct.len(), 1616);
+    let key = build_key_passraw(pw);
+    let pt = build_plaintext_for_1616_ct();
+    let ct = encrypt_cifraronline(&key, &pt);
+    assert_eq!(ct.len(), TOTAL_BIN_LEN);
     let b64 = STANDARD.encode(&ct);
     std::fs::write(path, b64).unwrap();
 }
 
 #[test]
-fn test_real_run_throughput_meets_target_1_5ghz() {
+fn test_real_run_throughput_meets_target() {
     let tmp = TempDir::new().unwrap();
     let input_path = tmp.path().join("cifrado.txt");
     let state_dir = tmp.path().join("state");
@@ -97,29 +107,25 @@ fn test_real_run_throughput_meets_target_1_5ghz() {
     let total = batches * (64u64 * 1024 * 1024);
     let ghs = total as f64 / elapsed.as_secs_f64() / 1.0e9;
     eprintln!(
-        "real run: batches={} total={} elapsed={:?} GH/s={:.3}",
+        "real run D-035: batches={} total={} elapsed={:?} GH/s={:.3}",
         batches, total, elapsed, ghs
     );
     assert!(
         matches!(outcome, RunOutcome::Paused { .. }),
         "esperaba Paused, obtuve {outcome:?}"
     );
-    // Tras D-029 (AES-256-ECB) el techo es algo menor que en CBC AES-128.
-    // En frío el kernel sostiene 1.5–2.0 GH/s avg; bajo carga térmica
-    // (ej. ejecutado tras la suite completa) baja a 1.2–1.4 GH/s. El
-    // umbral catches regresiones serias sin ser flaky.
+    // Tras D-035 (passraw + AES-128) el techo sube respecto a D-029.
+    // Esperamos 4-7 GH/s sostenidos. Piso conservador 2.0 GH/s.
     assert!(
-        ghs >= 1.0,
-        "throughput end-to-end {ghs:.3} GH/s < 1.0 GH/s — regresión seria del runner D-029"
+        ghs >= 2.0,
+        "throughput end-to-end {ghs:.3} GH/s < 2.0 GH/s — regresión seria del runner D-035"
     );
 }
 
 #[test]
 fn test_state_compat_with_pre_optimization_progress() {
-    // Tras D-029 el formato de `progress.toml` cambió. El fixture
-    // legacy (con `[[per_config]]`) DEBE ser rechazado con
-    // `StateError::LegacyFormat` para que el usuario sepa que tiene
-    // que ejecutar `quattro-crack reset --yes`.
+    // El fixture legacy (con `[[per_config]]`) sigue siendo rechazado
+    // post-D-035 igual que post-D-029.
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -131,7 +137,7 @@ fn test_state_compat_with_pre_optimization_progress() {
     );
 
     let err = load_progress_with_bak(&fixture)
-        .expect_err("legacy progress.toml debe ser rechazado tras D-029");
+        .expect_err("legacy progress.toml debe ser rechazado tras D-029/D-035");
     assert!(
         matches!(err, StateError::LegacyFormat { .. }),
         "esperaba LegacyFormat, obtuve {err:?}"

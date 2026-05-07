@@ -18,7 +18,10 @@ impl Rng {
     }
     fn next_u64(&mut self) -> u64 {
         // Numerical Recipes; ciclo 2^64.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn next_in_range(&mut self, n: u64) -> u64 {
@@ -103,7 +106,11 @@ fn test_year_field_is_top_weight() {
 fn test_alphabets_are_disjoint_and_complete() {
     // Vocales y consonantes no se solapan y cubren las 26 letras ASCII.
     for &v in VOWELS.iter() {
-        assert!(!CONSONANTS.contains(&v), "{} no debe estar en consonantes", v as char);
+        assert!(
+            !CONSONANTS.contains(&v),
+            "{} no debe estar en consonantes",
+            v as char
+        );
     }
     let mut all = Vec::new();
     all.extend_from_slice(VOWELS);

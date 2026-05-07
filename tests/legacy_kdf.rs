@@ -9,54 +9,217 @@
 use quattro_crack::kdf::legacy::{derive, Kdf};
 
 const VECTORS: &[(&str, Kdf, &str)] = &[
-    (".aAaabbbb1000.", Kdf::Md5Utf8,    "9ac15f8d5a92b3bc03a949212e6a6aed"),
-    (".aAaabbbb1000.", Kdf::Md5Utf16Le, "94481c80c010cd8f200e791ccea7e61a"),
-    (".aAaabbbb1000.", Kdf::Md5Utf16Be, "8bedc537a5dec2a34acad809db357ed7"),
-    (".aAaabbbb1000.", Kdf::Md5x2Utf8,  "fcffd97b40ba100bf1f51650022e7518"),
-    (".aAaabbbb1000.", Kdf::Md5Dup,     "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc03a949212e6a6aed"),
-    (".aAaabbbb1000.", Kdf::Md5Md5Rev,  "9ac15f8d5a92b3bc03a949212e6a6aeded6a6a2e2149a903bcb3925a8d5fc19a"),
-    (".aAaabbbb1000.", Kdf::Md5HexFull, "3961633135663864356139326233626330336139343932313265366136616564"),
-    (".aAaabbbb1000.", Kdf::Md5HexLo16, "39616331356638643561393262336263"),
-    (".aAaabbbb1000.", Kdf::PwPadded,   "2e6141616162626262313030302e0000"),
-
-    (".zzzzuuuU1999.", Kdf::Md5Utf8,    "9a3fbdba108501ac3f19bb7bee982974"),
-    (".zzzzuuuU1999.", Kdf::Md5Utf16Le, "63f6e7d991173f6489febc383780ab42"),
-    (".zzzzuuuU1999.", Kdf::Md5Utf16Be, "274d884fe1ce275a2ff73b7cacb46c30"),
-    (".zzzzuuuU1999.", Kdf::Md5x2Utf8,  "5ff6d2280f90df47a2ecfa618a1926a6"),
-    (".zzzzuuuU1999.", Kdf::Md5Dup,     "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac3f19bb7bee982974"),
-    (".zzzzuuuU1999.", Kdf::Md5Md5Rev,  "9a3fbdba108501ac3f19bb7bee982974742998ee7bbb193fac018510babd3f9a"),
-    (".zzzzuuuU1999.", Kdf::Md5HexFull, "3961336662646261313038353031616333663139626237626565393832393734"),
-    (".zzzzuuuU1999.", Kdf::Md5HexLo16, "39613366626462613130383530316163"),
-    (".zzzzuuuU1999.", Kdf::PwPadded,   "2e7a7a7a7a75757555313939392e0000"),
-
-    (".bAioembl1452.", Kdf::Md5Utf8,    "1289f8d7072cdede4f758cf77461c80a"),
-    (".bAioembl1452.", Kdf::Md5Utf16Le, "1dffe05a6b912ad43795c89ded4e647a"),
-    (".bAioembl1452.", Kdf::Md5Utf16Be, "1d803adcf89638814132f7c58dfa8937"),
-    (".bAioembl1452.", Kdf::Md5x2Utf8,  "6153594fc9a4970609948ed055d8858a"),
-    (".bAioembl1452.", Kdf::Md5Dup,     "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede4f758cf77461c80a"),
-    (".bAioembl1452.", Kdf::Md5Md5Rev,  "1289f8d7072cdede4f758cf77461c80a0ac86174f78c754fdede2c07d7f88912"),
-    (".bAioembl1452.", Kdf::Md5HexFull, "3132383966386437303732636465646534663735386366373734363163383061"),
-    (".bAioembl1452.", Kdf::Md5HexLo16, "31323839663864373037326364656465"),
-    (".bAioembl1452.", Kdf::PwPadded,   "2e6241696f656d626c313435322e0000"),
-
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Utf8,
+        "9ac15f8d5a92b3bc03a949212e6a6aed",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Utf16Le,
+        "94481c80c010cd8f200e791ccea7e61a",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Utf16Be,
+        "8bedc537a5dec2a34acad809db357ed7",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5x2Utf8,
+        "fcffd97b40ba100bf1f51650022e7518",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Dup,
+        "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc03a949212e6a6aed",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Md5Rev,
+        "9ac15f8d5a92b3bc03a949212e6a6aeded6a6a2e2149a903bcb3925a8d5fc19a",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5HexFull,
+        "3961633135663864356139326233626330336139343932313265366136616564",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5HexLo16,
+        "39616331356638643561393262336263",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::PwPadded,
+        "2e6141616162626262313030302e0000",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Utf8,
+        "9a3fbdba108501ac3f19bb7bee982974",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Utf16Le,
+        "63f6e7d991173f6489febc383780ab42",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Utf16Be,
+        "274d884fe1ce275a2ff73b7cacb46c30",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5x2Utf8,
+        "5ff6d2280f90df47a2ecfa618a1926a6",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Dup,
+        "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac3f19bb7bee982974",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Md5Rev,
+        "9a3fbdba108501ac3f19bb7bee982974742998ee7bbb193fac018510babd3f9a",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5HexFull,
+        "3961336662646261313038353031616333663139626237626565393832393734",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5HexLo16,
+        "39613366626462613130383530316163",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::PwPadded,
+        "2e7a7a7a7a75757555313939392e0000",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Utf8,
+        "1289f8d7072cdede4f758cf77461c80a",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Utf16Le,
+        "1dffe05a6b912ad43795c89ded4e647a",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Utf16Be,
+        "1d803adcf89638814132f7c58dfa8937",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5x2Utf8,
+        "6153594fc9a4970609948ed055d8858a",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Dup,
+        "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede4f758cf77461c80a",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Md5Rev,
+        "1289f8d7072cdede4f758cf77461c80a0ac86174f78c754fdede2c07d7f88912",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5HexFull,
+        "3132383966386437303732636465646534663735386366373734363163383061",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5HexLo16,
+        "31323839663864373037326364656465",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::PwPadded,
+        "2e6241696f656d626c313435322e0000",
+    ),
     // Fase 3.5
-    (".aAaabbbb1000.", Kdf::EvpMd5Aes256Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cbd9b4ed34eb9eaff1"),
-    (".aAaabbbb1000.", Kdf::EvpMd5Aes192Nosalt, "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cb"),
-    (".aAaabbbb1000.", Kdf::Md5Trunc24,         "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc"),
-    (".aAaabbbb1000.", Kdf::Md5Md5x2_24,        "9ac15f8d5a92b3bc03a949212e6a6aedfcffd97b40ba100b"),
-    (".aAaabbbb1000.", Kdf::Md5HexLo24,         "396163313566386435613932623362633033613934393231"),
-
-    (".zzzzuuuU1999.", Kdf::EvpMd5Aes256Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0682f1d54bba649b0"),
-    (".zzzzuuuU1999.", Kdf::EvpMd5Aes192Nosalt, "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0"),
-    (".zzzzuuuU1999.", Kdf::Md5Trunc24,         "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac"),
-    (".zzzzuuuU1999.", Kdf::Md5Md5x2_24,        "9a3fbdba108501ac3f19bb7bee9829745ff6d2280f90df47"),
-    (".zzzzuuuU1999.", Kdf::Md5HexLo24,         "396133666264626131303835303161633366313962623762"),
-
-    (".bAioembl1452.", Kdf::EvpMd5Aes256Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2ee916658be60ddcfa"),
-    (".bAioembl1452.", Kdf::EvpMd5Aes192Nosalt, "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2e"),
-    (".bAioembl1452.", Kdf::Md5Trunc24,         "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede"),
-    (".bAioembl1452.", Kdf::Md5Md5x2_24,        "1289f8d7072cdede4f758cf77461c80a6153594fc9a49706"),
-    (".bAioembl1452.", Kdf::Md5HexLo24,         "313238396638643730373263646564653466373538636637"),
+    (
+        ".aAaabbbb1000.",
+        Kdf::EvpMd5Aes256Nosalt,
+        "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cbd9b4ed34eb9eaff1",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::EvpMd5Aes192Nosalt,
+        "9ac15f8d5a92b3bc03a949212e6a6aedbffed351964404cb",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Trunc24,
+        "9ac15f8d5a92b3bc03a949212e6a6aed9ac15f8d5a92b3bc",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5Md5x2_24,
+        "9ac15f8d5a92b3bc03a949212e6a6aedfcffd97b40ba100b",
+    ),
+    (
+        ".aAaabbbb1000.",
+        Kdf::Md5HexLo24,
+        "396163313566386435613932623362633033613934393231",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::EvpMd5Aes256Nosalt,
+        "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0682f1d54bba649b0",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::EvpMd5Aes192Nosalt,
+        "9a3fbdba108501ac3f19bb7bee98297455d1298acd5cc8c0",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Trunc24,
+        "9a3fbdba108501ac3f19bb7bee9829749a3fbdba108501ac",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5Md5x2_24,
+        "9a3fbdba108501ac3f19bb7bee9829745ff6d2280f90df47",
+    ),
+    (
+        ".zzzzuuuU1999.",
+        Kdf::Md5HexLo24,
+        "396133666264626131303835303161633366313962623762",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::EvpMd5Aes256Nosalt,
+        "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2ee916658be60ddcfa",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::EvpMd5Aes192Nosalt,
+        "1289f8d7072cdede4f758cf77461c80a50d2964960bafb2e",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Trunc24,
+        "1289f8d7072cdede4f758cf77461c80a1289f8d7072cdede",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5Md5x2_24,
+        "1289f8d7072cdede4f758cf77461c80a6153594fc9a49706",
+    ),
+    (
+        ".bAioembl1452.",
+        Kdf::Md5HexLo24,
+        "313238396638643730373263646564653466373538636637",
+    ),
 ];
 
 #[test]
@@ -65,7 +228,8 @@ fn legacy_kdfs_match_python() {
         let got = derive(*kdf, pw.as_bytes());
         let got_hex = hex::encode(got.as_slice());
         assert_eq!(
-            &got_hex, expected_hex,
+            &got_hex,
+            expected_hex,
             "KDF legacy discrepa con Python para pw={pw:?} kdf={}",
             kdf.as_str()
         );
@@ -76,6 +240,10 @@ fn legacy_kdfs_match_python() {
 fn legacy_all_14_kdfs_covered_by_vectors() {
     for &kdf in Kdf::all() {
         let count = VECTORS.iter().filter(|(_, k, _)| *k == kdf).count();
-        assert!(count >= 3, "kdf legacy {} debería tener ≥3 vectores", kdf.as_str());
+        assert!(
+            count >= 3,
+            "kdf legacy {} debería tener ≥3 vectores",
+            kdf.as_str()
+        );
     }
 }
