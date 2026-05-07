@@ -60,6 +60,12 @@ pub struct Hit {
 /// Forma post-D-029: un único `next_step` (índice 0..N a probar a
 /// continuación), `tried` (candidatas barridas) y `elapsed_us`
 /// (microsegundos GPU acumulados).
+///
+/// Tras D-034 se añaden contadores de descartes `PrefixMismatch32` para
+/// que sean inspeccionables post-mortem aunque el proceso se cierre.
+/// Los campos viejos sin estas claves se cargan con default vía
+/// `#[serde(default)]`, preservando la compatibilidad de carga del
+/// `progress.toml` existente.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
     /// Siguiente paso a probar. `0` = no empezada. `N` = completada.
@@ -72,6 +78,12 @@ pub struct Progress {
     pub hits: Vec<Hit>,
     /// Timestamp ISO-8601 UTC del último flush.
     pub last_flush_utc: String,
+    /// Cuántos hits de kernel se descartaron por `PrefixMismatch32` (D-034).
+    #[serde(default)]
+    pub prefix32_mismatch_count: u64,
+    /// Primeros 16 idx donde ocurrió un `PrefixMismatch32`, para diagnóstico.
+    #[serde(default)]
+    pub prefix32_mismatch_idx_samples: Vec<u64>,
 }
 
 impl Progress {

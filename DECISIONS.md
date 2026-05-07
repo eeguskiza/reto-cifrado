@@ -1383,3 +1383,105 @@ flush final, escribe `[pausa]` y sale con código 0.
 - Cooperativo bit-exact verificado, conservado como referencia
   (no activo).
 - Resume desde production state validado.
+
+## D-034 — Bug del prefijo-32 con CRLF único + observabilidad de descartes
+
+### Contexto
+
+El barrido en producción (`logs/run-20260507-070833.log`) terminó al
+**100 % del espacio** (5,955 × 10¹³ candidatas) en 7,98 horas con
+**cero hits confirmados**. El usuario revisó las fotos de la pizarra
+del autor del reto y descubrió que el prefijo de 32 bytes que el código
+validaba era **incorrecto**.
+
+- Constante anterior: `b"Leonardo da Vinci\r\nLeonardo da V"` (CRLF único)
+- Constante real:     `b"Leonardo da Vinci\r\n\r\nLeonardo da"` (doble CRLF, línea en blanco intermedia)
+
+Los primeros 16 bytes (`Leonardo da Vinc`) coinciden, así que el filtro
+del kernel CUDA NO se vio afectado. El bug ocurría solo al validar
+bytes 16-31 en CPU vía `validate_hit`, que devolvía
+`HitVerdict::PrefixMismatch32` y **descartaba silenciosamente** la
+candidata.
+
+Bug secundario de observabilidad: estos descartes se emitían con
+`debug!()`, que con el `EnvFilter::new("info")` por defecto del proyecto
+**se filtraban del log**. Durante el barrido de 8 h no quedó traza
+ninguna. Imposible saber a posteriori si la clave correcta apareció y
+fue descartada.
+
+### Decisión
+
+**Bloque 1 — Corrección del prefijo-32**: `KNOWN_PREFIX_32` actualizado
+a `b"Leonardo da Vinci\r\n\r\nLeonardo da"` (17 + 4 + 11 = 32 B). Los
+plaintexts sintéticos en tests internos de `src/reference.rs` se
+actualizan también para reflejar el plaintext real. README sección
+"Validación de hit" actualizada.
+
+**Bloque 2 — Observabilidad y persistencia**:
+
+1. `HitVerdict::PrefixMismatch32` deja de ser unit variant y pasa a
+   llevar `plaintext_first_32: [u8; 32]`. `validate_hit` rellena el
+   campo desde el plaintext descifrado para que el runner no recalcule.
+2. La rama `PrefixMismatch32` del runner sube `debug!` → `info!` y
+   loguea `idx`, `password` y `plaintext_first_32_hex`. El log queda
+   trazable bajo el filtro por defecto.
+3. `Progress` gana dos campos persistentes en `progress.toml`:
+   - `prefix32_mismatch_count: u64` — contador total de descartes.
+   - `prefix32_mismatch_idx_samples: Vec<u64>` — primeros 16 idx donde
+     ocurrió, capped para no inflar el TOML.
+   Ambos llevan `#[serde(default)]`, así que un `progress.toml` viejo
+   pre-D-034 se carga con `count = 0` y `samples = []` (compatibilidad
+   de carga garantizada).
+4. `quattro-crack status` muestra una línea extra `prefix32 mismatch
+   N descartes (samples: idx=...)` solo si `N > 0`.
+5. El `info!` final de `PlanCompleted` incluye
+   `prefix32_mismatches=N`. Si `N > 0` se emite además un `warn!`
+   explícito al log invitando a inspección.
+
+### Por qué un descarte indica un bug
+
+Bajo AES-256-ECB + PKCS7 con plaintext real, la probabilidad de que el
+kernel reporte un hit por coincidencia de 16 B y los siguientes 16 B
+coincidan ALSO al azar es ~2⁻¹²⁸. En la práctica, cualquier descarte
+`PrefixMismatch32` en producción significa que la constante
+`KNOWN_PREFIX_32` está mal o que la KDF/kernel/ciphertext están
+corruptos. El warn final hace explícita esta interpretación.
+
+### Tests añadidos
+
+`tests/d034_prefix32_fix.rs` (4 tests verdes):
+
+1. `known_prefix_32_has_double_crlf` — layout binario exacto
+   (`[..17] = "Leonardo da Vinci"`, `[17..21] = "\r\n\r\n"`,
+   `[21..32] = "Leonardo da"`). Defensa contra regresión a CRLF único.
+2. `e2e_double_crlf_plaintext_finds_hit_confirmed` — cifra plaintext
+   sintético que arranca con doble CRLF, lanza kernel sobre rango que
+   contiene la clave `.lEonardo1452.`, verifica que `validate_hit`
+   devuelve `Confirmed`, NO `PrefixMismatch32`.
+3. `progress_persists_prefix32_counters` — round-trip TOML de los dos
+   campos nuevos.
+4. `legacy_progress_without_prefix32_fields_loads_with_defaults` —
+   carga un TOML viejo (pre-D-034) y verifica que `count = 0` y
+   `samples = []`.
+
+`tests/block4_adversarial.rs` y `src/reference.rs` actualizan sus
+match arms al nuevo struct variant.
+
+### Resultado
+
+- **99 tests verdes** + 10 ignorados (diagnóstico opt-in). Subida de
+  95 → 99 por los 4 nuevos tests de D-034.
+- **Clippy `-D warnings` limpio**.
+- Compatibilidad backward del TOML preservada vía
+  `#[serde(default)]`.
+- El barrido nuevo encontrará la clave (si existe) y la confirmará en
+  stdout. Si no la encuentra, los logs y el state guardarán los
+  descartes para diagnosticar qué hipótesis del enunciado es falsa.
+
+### Lección
+
+El path de descarte silencioso es un anti-patrón de observabilidad.
+Cualquier evento que en teoría no debería ocurrir (probabilidad
+~2⁻¹²⁸) merece `info!` o superior, no `debug!`. Si nunca ocurre, no
+ensucia el log; si ocurre, queda trazado. Los contadores persistentes
+en el state cubren el caso de proceso que muere antes del análisis.

@@ -69,7 +69,8 @@ de ciphertext puros**, decodificados desde base64, divididos en
 Una clave es hit confirmado solo si:
 
 1. primeros 16 B del PT = `Leonardo da Vinc` (kernel)
-2. primeros 32 B del PT = `Leonardo da Vinci\r\nLeonardo da V` (CPU)
+2. primeros 32 B del PT = `Leonardo da Vinci\r\n\r\nLeonardo da` (CPU)
+   (17 B + doble CRLF + 11 B; ver D-034 para el bug del CRLF único)
 3. padding PKCS7 del último bloque válido (CPU)
 
 Si pasa (1)+(2) pero falla (3) → bug crítico, runner aborta.
@@ -282,6 +283,36 @@ Para reanudar el barrido bajo el nuevo formato:
 quattro-crack reset --yes        # borra state/ legacy
 quattro-crack run                # arranca plan único desde idx=0
 ```
+
+### Mi barrido completó al 100 % sin hit, ¿qué hago?
+
+Antes de relanzar a ciegas, **revisa los descartes
+`PrefixMismatch32`** vía `quattro-crack status`:
+
+```
+prefix32 mismatch    1234 descartes (samples: idx=[100, 250, ...])
+```
+
+Esa línea aparece solo si `prefix32_mismatch_count > 0`. Significado:
+el kernel reportó hits que coincidían en los 16 primeros bytes
+(`Leonardo da Vinc`) pero la CPU descartó porque los siguientes 16 NO
+matcheaban `KNOWN_PREFIX_32`. Bajo AES-256-ECB con plaintext real,
+esto es ~2⁻¹²⁸ por puro azar — un descarte indica casi seguro un bug
+en `KNOWN_PREFIX_32` o en la KDF/kernel/ciphertext. Ver D-034 para el
+caso real de CRLF único que descartó la clave correcta durante un
+barrido completo de 8 horas.
+
+El log también lleva las entradas:
+
+```
+INFO PREFIX32_MISMATCH descartado por validación CPU (D-034)
+     idx=... password=... plaintext_first_32_hex=...
+```
+
+Compara `plaintext_first_32_hex` con `KNOWN_PREFIX_32` byte a byte:
+los 16 primeros B siempre coincidirán (es lo que filtra el kernel),
+pero los 16 siguientes te dicen exactamente qué prefijo tiene el
+plaintext real. Si tu constante hardcodeada está mal, ahí lo verás.
 
 ## Benchmark
 

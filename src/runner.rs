@@ -469,9 +469,22 @@ pub fn run(
                         dh.idx
                     ));
                 }
-                HitVerdict::PrefixMismatch32 => {
+                HitVerdict::PrefixMismatch32 { plaintext_first_32 } => {
                     sink.on_event(ProgressEvent::HitDiscardedPrefixMismatch { idx: dh.idx });
-                    debug!(idx = dh.idx, "kernel false positive (prefix32 mismatch)");
+                    let pw_str = std::str::from_utf8(pw_utf8)
+                        .unwrap_or("<no utf8>")
+                        .to_string();
+                    info!(
+                        idx = dh.idx,
+                        password = %pw_str,
+                        plaintext_first_32_hex = %hex::encode(plaintext_first_32),
+                        "PREFIX32_MISMATCH descartado por validación CPU (D-034)"
+                    );
+                    progress.prefix32_mismatch_count =
+                        progress.prefix32_mismatch_count.saturating_add(1);
+                    if progress.prefix32_mismatch_idx_samples.len() < 16 {
+                        progress.prefix32_mismatch_idx_samples.push(dh.idx);
+                    }
                 }
             }
         }
@@ -508,8 +521,21 @@ pub fn run(
     info!(
         elapsed_s = elapsed.as_secs_f64(),
         hits = progress.hits.len(),
+        prefix32_mismatches = progress.prefix32_mismatch_count,
         "plan completed without confirmed hit"
     );
+    if progress.prefix32_mismatch_count > 0 {
+        warn!(
+            count = progress.prefix32_mismatch_count,
+            samples = ?progress.prefix32_mismatch_idx_samples,
+            "{} descartes por prefix32 mismatch durante el barrido. \
+             Revisa state/progress.toml campo prefix32_mismatch_idx_samples \
+             para diagnóstico. Esto NO debería ocurrir si la construcción \
+             criptográfica es correcta — un descarte indica un bug \
+             potencial en la constante KNOWN_PREFIX_32 (D-034).",
+            progress.prefix32_mismatch_count
+        );
+    }
     Ok(RunOutcome::Completed {
         elapsed_secs: elapsed.as_secs_f64(),
     })

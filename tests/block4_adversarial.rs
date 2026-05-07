@@ -231,7 +231,10 @@ fn test_prefix32_mismatch_synthetic_legacy_and_coop() {
     // CPU descarta el hit del idx con PrefixMismatch32 (no aborta).
     let verdict = validate_hit(&key, &ct).expect("validate_hit");
     match verdict {
-        HitVerdict::PrefixMismatch32 => {}
+        HitVerdict::PrefixMismatch32 { plaintext_first_32 } => {
+            assert_eq!(&plaintext_first_32[..16], KNOWN_PREFIX_16);
+            assert_eq!(&plaintext_first_32[16..32], b"NO_COINCIDE_32B!");
+        }
         other => panic!("esperaba PrefixMismatch32, obtuve {other:?}"),
     }
 }

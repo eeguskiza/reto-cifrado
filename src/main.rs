@@ -238,6 +238,13 @@ fn status_cmd(state_dir: &Path) -> Result<()> {
         println!("tried        {}", progress.tried);
         println!("hits         {}", progress.hits.len());
         println!("last_flush   {}", progress.last_flush_utc);
+        if progress.prefix32_mismatch_count > 0 {
+            println!(
+                "prefix32 mismatch    {} descartes (samples: idx={:?})",
+                progress.prefix32_mismatch_count,
+                progress.prefix32_mismatch_idx_samples
+            );
+        }
     } else {
         println!("(sin progreso persistido todavía — ejecuta `run` para iniciar)");
     }
